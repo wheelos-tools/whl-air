@@ -16,7 +16,7 @@ struct CockpitConfig {
 
   // Local transport server config
   std::string transport_server_address = "127.0.0.1";
-  uint16_t transport_server_port = 8080;
+  uint16_t transport_server_port = 8899;
   std::string display_files_path =
       "display/public";  // Path to serve static web files
 

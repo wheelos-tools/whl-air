@@ -3,7 +3,7 @@ const path = require('path');
 
 module.exports = {
     server: {
-        port: process.env.PORT || 8081, // Listen on port 8081, or environment variable PORT
+        port: process.env.PORT || 8898, // Listen on port 8898, or environment variable PORT
         ssl: {
             enabled: process.env.SSL_ENABLED === 'true', // Enable SSL based on env var
             key: process.env.SSL_KEY_PATH || path.join(__dirname, 'certs', 'server.key'),

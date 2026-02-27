@@ -2,7 +2,7 @@
 
 // Define global app configuration (or fetch from a config endpoint on TransportServer)
 const APP_CONFIG = {
-    WEBSOCKET_URL: `ws://${window.location.hostname}:8080`, // Match TransportServer address and port
+    WEBSOCKET_URL: `ws://${window.location.hostname}:8899`, // Match TransportServer address and port
     TARGET_VEHICLE_ID: 'vehicle_client_dummy_id', // Match the ID of the vehicle client you want to connect to
     CLIENT_ID: 'cockpit_client_browser_' + Math.random().toString(16).slice(2, 8), // Generate a unique ID for this browser instance
     // WebRTC ICE server configuration (STUN/TURN) - match vehicle_client config

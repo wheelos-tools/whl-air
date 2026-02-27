@@ -17,7 +17,7 @@ COPY config.js ./
 COPY certs ./certs # Copy the certs directory
 
 # Expose the port the server listens on (adjust if you change the default port)
-EXPOSE 8081
+EXPOSE 8898
 
 # Command to run the application
 CMD ["npm", "start"]

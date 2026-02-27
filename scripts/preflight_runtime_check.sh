@@ -58,8 +58,8 @@ check_cmd node
 check_cmd npm
 check_cmd ss
 
-check_port 8081
-check_port 8080
+check_port 8898
+check_port 8899
 
 check_file_exists "$ROOT_DIR/signaling_server/package.json"
 check_file_exists "$ROOT_DIR/signaling_server/src/server.js"
