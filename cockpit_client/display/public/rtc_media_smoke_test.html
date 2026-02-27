@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTC Media Smoke Test</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    .row { display: flex; gap: 16px; margin-top: 12px; }
+    video { width: 360px; height: 240px; background: #111; border-radius: 6px; }
+    button { margin-right: 8px; padding: 8px 12px; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 6px; min-height: 180px; }
+    .ok { color: #0a7f2e; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC Media Smoke Test (addTrack / ontrack)</h2>
+  <p>Checks camera track addTrack + loopback negotiation + remote ontrack.</p>
+
+  <div>
+    <button id="btnRun">Run Media Test</button>
+    <button id="btnReset">Reset</button>
+    <span id="status">Idle</span>
+  </div>
+
+  <div class="row">
+    <div>
+      <h4>Local</h4>
+      <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+    <div>
+      <h4>Remote</h4>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <h3>Log</h3>
+  <pre id="log"></pre>
+
+  <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+  <script>
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+
+    let localStream = null;
+    let pc1 = null;
+    let pc2 = null;
+
+    function log(msg, cls = '') {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      if (cls) line.className = cls;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg, ok = null) {
+      statusEl.textContent = msg;
+      statusEl.className = ok === null ? '' : (ok ? 'ok' : 'err');
+    }
+
+    function cleanup() {
+      try { if (pc1) pc1.close(); } catch {}
+      try { if (pc2) pc2.close(); } catch {}
+      pc1 = null;
+      pc2 = null;
+
+      if (localStream) {
+        for (const track of localStream.getTracks()) {
+          track.stop();
+        }
+      }
+      localStream = null;
+      localVideo.srcObject = null;
+      remoteVideo.srcObject = null;
+    }
+
+    async function runMediaTest() {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Running...', null);
+
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        localVideo.srcObject = localStream;
+        log('getUserMedia success');
+
+        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        pc1 = new RTCPeerConnection(rtcConfig);
+        pc2 = new RTCPeerConnection(rtcConfig);
+
+        pc1.onicecandidate = (event) => {
+          if (event.candidate) {
+            pc2.addIceCandidate(event.candidate).catch(err => log(`pc2 addIceCandidate failed: ${err}`, 'err'));
+          }
+        };
+        pc2.onicecandidate = (event) => {
+          if (event.candidate) {
+            pc1.addIceCandidate(event.candidate).catch(err => log(`pc1 addIceCandidate failed: ${err}`, 'err'));
+          }
+        };
+
+        const remoteTrackPromise = new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('remote ontrack timeout')), 15000);
+          pc2.ontrack = (event) => {
+            log(`pc2 ontrack kind=${event.track.kind}`);
+            remoteVideo.srcObject = event.streams[0];
+            clearTimeout(timeout);
+            resolve();
+          };
+        });
+
+        for (const track of localStream.getTracks()) {
+          pc1.addTrack(track, localStream);
+          log(`pc1 addTrack kind=${track.kind}`);
+        }
+
+        const offer = await pc1.createOffer();
+        await pc1.setLocalDescription(offer);
+        await pc2.setRemoteDescription(offer);
+        log('Offer applied');
+
+        const answer = await pc2.createAnswer();
+        await pc2.setLocalDescription(answer);
+        await pc1.setRemoteDescription(answer);
+        log('Answer applied');
+
+        await remoteTrackPromise;
+        setStatus('PASS: addTrack/ontrack media path OK', true);
+        log('Media smoke test passed', 'ok');
+      } catch (err) {
+        setStatus(`FAIL: ${err.message || err}`, false);
+        log(`Media smoke test failed: ${err.stack || err}`, 'err');
+      }
+    }
+
+    document.getElementById('btnRun').addEventListener('click', runMediaTest);
+    document.getElementById('btnReset').addEventListener('click', () => {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Idle', null);
+    });
+  </script>
+</body>
+</html>

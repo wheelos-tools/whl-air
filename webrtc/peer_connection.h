@@ -6,8 +6,7 @@
 #include <string>
 #include <vector>
 
-// Include the callback struct definition
-#include "peer_connection_callbacks.h"
+#include "webrtc/i_webrtc_manager.h"
 
 // Forward declare potential configuration struct
 // In a real system, this would be defined in a config header.
@@ -20,28 +19,8 @@ namespace autodev {
 namespace remote {
 namespace webrtc {
 
-// Define types for DataChannel messages
-using DataChannelMessage = std::vector<char>;
+struct PeerConnectionCallbacks;
 
-// Define common WebRTC states (simplified example, concrete impl will map
-// libwebrtc enums)
-enum class PeerConnectionState {
-  New,
-  Connecting,
-  Connected,
-  Disconnected,
-  Failed,
-  Closed
-};
-enum class IceConnectionState {
-  New,
-  Checking,
-  Connected,
-  Completed,
-  Failed,
-  Disconnected,
-  Closed
-};
 enum class SignalingState {
   Stable,
   HaveLocalOffer,

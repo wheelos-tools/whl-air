@@ -1,0 +1,7 @@
+# vehicle client bootstrap config (key=value)
+client_id=vehicle_client_alpha
+camera_fps=15
+telemetry_interval_ms=200
+heartbeat_interval_ms=1000
+control_channel_label=control
+telemetry_channel_label=telemetry

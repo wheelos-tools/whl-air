@@ -1,0 +1,24 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "signaling_headers",
+    hdrs = [
+        "signaling_client.h",
+        "signaling_message.h",
+    ],
+)
+
+cc_library(
+    name = "signaling_client_base_lib",
+    srcs = ["signaling_client_base.cc"],
+    hdrs = ["signaling_client.h"],
+    copts = ["-std=c++17"],
+    deps = [":signaling_headers"],
+)
+
+cc_library(
+    name = "signaling_message_lib",
+    srcs = ["signaling_message.cc"],
+    hdrs = ["signaling_message.h"],
+    copts = ["-std=c++17"],
+)

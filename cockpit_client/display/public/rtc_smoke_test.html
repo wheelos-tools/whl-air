@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTC Smoke Test</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    button { margin-right: 8px; padding: 8px 12px; }
+    .ok { color: #0a7f2e; }
+    .err { color: #b00020; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 6px; min-height: 220px; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC Smoke Test (Local Loopback)</h2>
+  <p>Checks: RTCPeerConnection init → offer/answer exchange → ICE candidate exchange → DataChannel ping/pong.</p>
+
+  <div>
+    <button id="btnRun">Run Test</button>
+    <button id="btnReset">Reset</button>
+    <span id="status">Idle</span>
+  </div>
+
+  <h3>Log</h3>
+  <pre id="log"></pre>
+
+  <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+  <script>
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+    const btnRun = document.getElementById('btnRun');
+    const btnReset = document.getElementById('btnReset');
+
+    let pc1 = null;
+    let pc2 = null;
+    let dc1 = null;
+    let dc2 = null;
+
+    function log(msg, cls = '') {
+      const line = document.createElement('div');
+      if (cls) line.className = cls;
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg, ok = null) {
+      statusEl.textContent = msg;
+      statusEl.className = ok === null ? '' : (ok ? 'ok' : 'err');
+    }
+
+    function cleanup() {
+      try { if (dc1) dc1.close(); } catch {}
+      try { if (dc2) dc2.close(); } catch {}
+      try { if (pc1) pc1.close(); } catch {}
+      try { if (pc2) pc2.close(); } catch {}
+      pc1 = pc2 = dc1 = dc2 = null;
+    }
+
+    async function runTest() {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Running...', null);
+
+      try {
+        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        pc1 = new RTCPeerConnection(rtcConfig);
+        pc2 = new RTCPeerConnection(rtcConfig);
+        log('Created pc1/pc2');
+
+        pc1.onicecandidate = (e) => {
+          if (e.candidate) {
+            pc2.addIceCandidate(e.candidate).catch(err => log(`pc2 addIceCandidate failed: ${err}`, 'err'));
+          }
+        };
+        pc2.onicecandidate = (e) => {
+          if (e.candidate) {
+            pc1.addIceCandidate(e.candidate).catch(err => log(`pc1 addIceCandidate failed: ${err}`, 'err'));
+          }
+        };
+
+        const iceStates = { pc1: 'new', pc2: 'new' };
+        pc1.oniceconnectionstatechange = () => {
+          iceStates.pc1 = pc1.iceConnectionState;
+          log(`pc1 iceConnectionState=${iceStates.pc1}`);
+        };
+        pc2.oniceconnectionstatechange = () => {
+          iceStates.pc2 = pc2.iceConnectionState;
+          log(`pc2 iceConnectionState=${iceStates.pc2}`);
+        };
+
+        const pongPromise = new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('DataChannel ping/pong timeout')), 12000);
+
+          dc1 = pc1.createDataChannel('smoke');
+          dc1.onopen = () => {
+            log('dc1 open, sending ping');
+            dc1.send('ping');
+          };
+          dc1.onmessage = (e) => {
+            log(`dc1 received: ${e.data}`);
+            if (e.data === 'pong') {
+              clearTimeout(timeout);
+              resolve();
+            }
+          };
+          dc1.onerror = (e) => log(`dc1 error: ${e?.message || 'unknown'}`, 'err');
+
+          pc2.ondatachannel = (event) => {
+            dc2 = event.channel;
+            log(`dc2 received channel: ${dc2.label}`);
+            dc2.onmessage = (e) => {
+              log(`dc2 received: ${e.data}`);
+              if (e.data === 'ping') dc2.send('pong');
+            };
+            dc2.onerror = (e) => log(`dc2 error: ${e?.message || 'unknown'}`, 'err');
+          };
+        });
+
+        const offer = await pc1.createOffer();
+        await pc1.setLocalDescription(offer);
+        await pc2.setRemoteDescription(offer);
+        log('Applied offer/local+remote');
+
+        const answer = await pc2.createAnswer();
+        await pc2.setLocalDescription(answer);
+        await pc1.setRemoteDescription(answer);
+        log('Applied answer/local+remote');
+
+        await pongPromise;
+        setStatus('PASS: offer/answer + ICE + DataChannel OK', true);
+        log('Smoke test passed', 'ok');
+      } catch (err) {
+        setStatus(`FAIL: ${err.message || err}`, false);
+        log(`Smoke test failed: ${err.stack || err}`, 'err');
+      }
+    }
+
+    btnRun.addEventListener('click', runTest);
+    btnReset.addEventListener('click', () => {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Idle', null);
+    });
+  </script>
+</body>
+</html>

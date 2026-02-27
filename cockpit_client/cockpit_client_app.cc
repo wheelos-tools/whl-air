@@ -1,832 +1,587 @@
-#include "cockpit_client_app.h"
-
-// Include concrete implementations (creation moved to main)
-#include "config/json_config_loader.h"
-#include "drivers/input_device_source_impl.h"
-#include "drivers/telemetry_handler_impl.h"
-#include "drivers/web_command_handler_impl.h"
-#include "network_manager/connection_monitor_impl.h"
-#include "transport/websocket_transport_server.h"
-#include "webrtc/webrtc_manager_impl.h"
-
-// Include Protobuf messages that need deserialization in the app
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <functional>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
-#include <memory>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
-#include "chassis/proto/chassis.pb.h"  // For handleWebrtcDataChannelMessageReceived
+#include "cockpit_client/domain/runtime_state.h"
 
-// Include event loop library (e.g., Asio)
-// #include <boost/asio.hpp>
+namespace {
 
-// Global application instance pointer for signal handling (see comments in .h)
-// This is a common pattern for signal handlers, but has limitations.
-// Define the global pointer in the global namespace, outside the autodev
-// namespace.
-CockpitClientApp* global_app_instance =
-    nullptr;  // Use forward declaration in .h
+struct RuntimeConfig {
+  std::string client_id = "cockpit_client_default";
+  std::string target_vehicle_id = "vehicle_client_default";
+  int heartbeat_interval_ms = 1000;
+  int telemetry_interval_ms = 200;
+  int connect_delay_ms = 300;
+  std::string control_channel_label = "control";
+  std::string telemetry_channel_label = "telemetry";
+};
 
-// Signal handler function (defined outside namespace if used with global
-// pointer)
-void signal_handler(int signal) {
-  std::cout << "\nReceived signal " << signal << ". Stopping application..."
-            << std::endl;
-  // Safely check the global instance pointer before calling stop()
-  if (global_app_instance) {
-    global_app_instance->stop();
+using RuntimeState = cockpit_domain::RuntimeState;
+using RuntimeStats = cockpit_domain::RuntimeStats;
+
+std::atomic<bool> g_stop_requested{false};
+
+void signal_handler(int signal_number) {
+  std::cerr << "cockpit_client_app received signal " << signal_number
+            << ", stopping..." << std::endl;
+  g_stop_requested = true;
+}
+
+std::string trim(const std::string& value) {
+  const char* ws = " \t\r\n";
+  const auto begin = value.find_first_not_of(ws);
+  if (begin == std::string::npos) {
+    return "";
+  }
+  const auto end = value.find_last_not_of(ws);
+  return value.substr(begin, end - begin + 1);
+}
+
+bool to_int(const std::string& value, int* out) {
+  try {
+    *out = std::stoi(value);
+    return true;
+  } catch (...) {
+    return false;
   }
 }
 
-namespace autodev {
-namespace remote {
-namespace cockpit {
-
-// --- Constructor and Destructor ---
-
-CockpitClientApp::CockpitClientApp() : state_(AppState::Uninitialized) {
-  std::cout << "CockpitClientApp created." << std::endl;
-  // TODO: Initialize event loop context if owned by the app
-  // ioContext_ = std::make_unique<boost::asio::io_context>();
-}
-
-CockpitClientApp::~CockpitClientApp() {
-  std::cout << "CockpitClientApp destroying..." << std::endl;
-  // Ensure stop is called to clean up components and event loop
-  stop();
-  // Components will be destroyed automatically by unique_ptr/shared_ptr members
-  std::cout << "CockpitClientApp destroyed." << std::endl;
-}
-
-// --- Initialization ---
-
-bool CockpitClientApp::init(
-    const CockpitConfig& config,
-    std::shared_ptr<autodev::remote::webrtc::WebrtcManager> webrtcManager,
-    std::shared_ptr<autodev::remote::transport::ITransportServer>
-        transportServer,
-    std::unique_ptr<autodev::remote::drivers::IWebCommandHandler>
-        webCommandHandler,
-    std::unique_ptr<autodev::remote::drivers::IInputDeviceSource>
-        inputDeviceSource,
-    std::unique_ptr<autodev::remote::drivers::ITelemetryHandler>
-        telemetryHandler,
-    std::unique_ptr<autodev::remote::network_manager::IConnectionMonitor>
-        connectionMonitor /*= nullptr*/)
-// TODO: Add std::shared_ptr<boost::asio::io_context> ioContext as parameter
-{
-  // Use atomic state check
-  AppState expected = AppState::Uninitialized;
-  if (!state_.compare_exchange_strong(expected, AppState::Initializing)) {
-    std::cerr
-        << "CockpitClientApp: Already initialized or in a different state."
-        << std::endl;
+bool load_config(const std::string& config_path, RuntimeConfig* config) {
+  std::ifstream input(config_path);
+  if (!input.is_open()) {
+    std::cerr << "Failed to open config: " << config_path << std::endl;
     return false;
   }
 
-  std::cout << "CockpitClientApp: Initializing..." << std::endl;
-
-  // 1. Store Configuration
-  config_ = config;
-  std::cout << "CockpitClientApp: Config stored." << std::endl;
-
-  // 2. Store Injected Components (Transfer ownership/share ownership)
-  webrtcManager_ = std::move(webrtcManager);
-  transportServer_ = std::move(transportServer);
-  webCommandHandler_ =
-      std::move(webCommandHandler);  // Store the web command handler
-  inputDeviceSource_ =
-      std::move(inputDeviceSource);  // Store the input device source
-  telemetryHandler_ = std::move(telemetryHandler);
-  connectionMonitor_ = std::move(connectionMonitor);
-  // TODO: Store ioContext_ = std::move(ioContext);
-
-  // Validate essential components were injected
-  if (!webrtcManager_ || !transportServer_ || !webCommandHandler_ ||
-      !inputDeviceSource_ || !telemetryHandler_) {
-    std::cerr << "CockpitClientApp: Essential components not injected!"
-              << std::endl;
-    state_ = AppState::Uninitialized;  // Reset state on failure
-    return false;
-  }
-  std::cout << "CockpitClientApp: Components injected and stored." << std::endl;
-
-  // 3. Setup Components (Call init and set callbacks on injected components)
-
-  // Initialize Transport Server
-  if (!transportServer_->init(config_.transport_server_address,
-                              config_.transport_server_port,
-                              config_.display_files_path)) {
-    std::cerr << "CockpitClientApp: Failed to initialize Transport Server."
-              << std::endl;
-    state_ = AppState::Uninitialized;
-    return false;
-  }
-  if (!setupTransportServerCallbacks()) {
-    std::cerr << "CockpitClientApp: Failed to setup Transport Server callbacks."
-              << std::endl;
-    state_ = AppState::Uninitialized;
-    return false;
-  }
-  std::cout
-      << "CockpitClientApp: Transport server initialized and callbacks setup."
-      << std::endl;
-
-  // Initialize WebRTC Manager
-  // TODO: webrtcManager_->init(config_.webrtc_config, ioContext_); // Assuming
-  // WebRTC Manager has an init and needs ioContext
-  if (!setupWebrtcManagerCallbacks()) {
-    std::cerr << "CockpitClientApp: Failed to setup WebRTC Manager callbacks."
-              << std::endl;
-    state_ = AppState::Uninitialized;
-    return false;
-  }
-  std::cout
-      << "CockpitClientApp: WebRTC manager initialized and callbacks setup."
-      << std::endl;
-
-  // Initialize Handlers/Sources that handle commands and telemetry
-  // They depend on WebrtcManager/TransportServer - already injected/stored
-  if (!setupCommandAndInputHandlers()) {
-    std::cerr << "CockpitClientApp: Failed to setup Command and Input "
-                 "Handlers/Sources."
-              << std::endl;
-    state_ = AppState::Uninitialized;
-    return false;
-  }
-  std::cout
-      << "CockpitClientApp: Command and Input Handlers/Sources initialized."
-      << std::endl;
-
-  if (!setupTelemetryHandler()) {
-    std::cerr << "CockpitClientApp: Failed to setup Telemetry Handler."
-              << std::endl;
-    state_ = AppState::Uninitialized;
-    return false;
-  }
-  std::cout << "CockpitClientApp: Telemetry Handler initialized." << std::endl;
-
-  // Setup Connection Monitor callbacks only if monitor is provided
-  if (connectionMonitor_) {
-    // TODO: connectionMonitor_->init(ioContext_, webrtcManager_,
-    // config_.heartbeat_interval_ms); // Initialize monitor with
-    // dependencies/config
-    if (!setupConnectionMonitorCallbacks()) {
-      std::cerr
-          << "CockpitClientApp: Failed to setup Connection Monitor callbacks."
-          << std::endl;
-      state_ = AppState::Uninitialized;
+  std::unordered_map<std::string, std::string> kv;
+  std::string line;
+  while (std::getline(input, line)) {
+    line = trim(line);
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    const auto pos = line.find('=');
+    if (pos == std::string::npos) {
+      std::cerr << "Invalid config line (expected key=value): " << line
+                << std::endl;
       return false;
     }
-    std::cout << "CockpitClientApp: Connection monitor initialized and "
-                 "callbacks setup."
-              << std::endl;
-  } else {
-    std::cout << "CockpitClientApp: Connection Monitor not provided."
-              << std::endl;
-  }
-
-  state_ = AppState::Initialized;
-  std::cout << "CockpitClientApp: Initialization successful." << std::endl;
-  return true;
-}
-
-// --- Running the Application ---
-
-int CockpitClientApp::run() {
-  AppState expected = AppState::Initialized;
-  if (!state_.compare_exchange_strong(expected, AppState::Running)) {
-    std::cerr << "CockpitClientApp: Cannot run, not in Initialized state."
-              << std::endl;
-    return 1;  // Indicate error
-  }
-
-  std::cout << "CockpitClientApp: Running main loop..." << std::endl;
-
-  // 1. Start local transport server (serves UI, handles WS)
-  if (!transportServer_->start()) {
-    std::cerr << "CockpitClientApp: Failed to start transport server."
-              << std::endl;
-    // TODO: Decide if app should stop or retry/report error
-    state_ = AppState::Stopped;  // Transition to stopped on major failure
-    return 1;
-  }
-  std::cout << "CockpitClientApp: Transport server started." << std::endl;
-
-  // 2. Start WebRTC manager (connects to signaling, handles PC)
-  if (!webrtcManager_->start()) {
-    std::cerr << "CockpitClientApp: Failed to start WebRTC manager."
-              << std::endl;
-    // Clean up transport server before exiting
-    transportServer_->stop();
-    state_ = AppState::Stopped;  // Transition to stopped on major failure
-    return 1;
-  }
-  std::cout << "CockpitClientApp: WebRTC manager started." << std::endl;
-
-  // 3. Start input device polling/sending loop
-  if (!inputDeviceSource_->startPolling()) {
-    std::cerr
-        << "CockpitClientApp: Failed to start input device source polling."
-        << std::endl;
-    // Decide failure policy: continue without device input? or stop?
-    // For critical input, maybe stop. For non-critical, maybe log and continue.
-    // Let's assume it's critical for remote driving and stop.
-    webrtcManager_->stop();
-    transportServer_->stop();
-    state_ = AppState::Stopped;  // Transition to stopped on major failure
-    return 1;
-  }
-  std::cout << "CockpitClientApp: Input device source polling started."
-            << std::endl;
-
-  // 4. Start connection monitor (if used)
-  if (connectionMonitor_) {
-    connectionMonitor_->start();
-    std::cout << "CockpitClientApp: Connection monitor started." << std::endl;
-  }
-
-  // 5. Run the main event loop
-  // This is where the application blocks, handling events from WebRTC,
-  // WebSocket server, timers, etc.
-  // TODO: Implement event loop execution using the injected/owned ioContext
-  // The event loop is the heart of the application. It receives events (network
-  // data, timer expirations, etc.) and dispatches calls to the appropriate
-  // handlers (the callbacks registered in setupXxxCallbacks). The main thread
-  // will typically run or join the thread running the event loop.
-
-  // Example using Asio:
-  // if (ioContext_) {
-  //     std::cout << "CockpitClientApp: Starting Asio io_context..." <<
-  //     std::endl;
-  //     // Option A: Run on main thread (blocks main)
-  //     // ioContext_->run();
-  //
-  //     // Option B: Run on a separate thread (main thread waits or does other
-  //     work)
-  //     // ioThread_ = std::make_unique<std::thread>([this](){
-  //     //     try { ioContext_->run(); } catch(...) { /* handle exceptions */
-  //     }
-  //     // });
-  //     // ioThread_->join(); // Block main thread until io_context stops
-  //     std::cout << "CockpitClientApp: Asio io_context finished." <<
-  //     std::endl;
-  // } else {
-  // Placeholder for simulation if no event loop framework is used
-  // This loop needs a way to break when stop() is called, typically
-  // by signaling the loop/context or using a condition variable signaled by
-  // stop().
-  std::cout
-      << "CockpitClientApp: Using simulated run loop (No real event loop)..."
-      << std::endl;
-  while (state_ == AppState::Running) {
-    // In a real app, this loop is replaced by event loop.
-    // Placeholder sleep prevents high CPU usage in simulation.
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    // std::cout << "App running..." << std::endl; // Avoid spamming output
-  }
-  std::cout << "CockpitClientApp: Simulated run loop finished." << std::endl;
-  // }
-
-  std::cout << "CockpitClientApp: Run method exiting." << std::endl;
-  // The state should transition to STOPPED during or after the stop() call,
-  // but ensure it's finalized here if the run loop exited for other reasons.
-  if (state_ != AppState::Stopped) {
-    state_ = AppState::Stopped;
-  }
-  return 0;  // Indicate success
-}
-
-// --- Stopping the Application ---
-
-void CockpitClientApp::stop() {
-  // Use atomic compare_exchange to ensure only one thread performs stopping
-  AppState expected = AppState::Running;
-  if (!state_.compare_exchange_strong(expected, AppState::Stopping)) {
-    expected = AppState::Initialized;  // Also allow stopping from Initialized
-                                       // state if run() wasn't called
-    if (!state_.compare_exchange_strong(expected, AppState::Stopping)) {
-      std::cout << "CockpitClientApp: Already stopping, stopped, or "
-                   "uninitialized. Skipping stop."
-                << std::endl;
-      return;
+    std::string key = trim(line.substr(0, pos));
+    std::string value = trim(line.substr(pos + 1));
+    if (!key.empty()) {
+      kv[key] = value;
     }
   }
 
-  std::cout << "CockpitClientApp: Stopping..." << std::endl;
-
-  // 1. Signal event loop to stop if it's running (must be done before joining
-  // thread)
-  // TODO: if (ioContext_) { ioContext_->stop(); }
-
-  // 2. Stop components in a safe order (dependent components first)
-  // Stop connection monitoring first (depends on WebRTC Manager)
-  if (connectionMonitor_) {
-    connectionMonitor_->stop();
-    std::cout << "CockpitClientApp: Connection Monitor stopped." << std::endl;
+  if (kv.count("client_id")) {
+    config->client_id = kv["client_id"];
   }
-  // Stop input device polling (might have a background thread)
-  if (inputDeviceSource_) {
-    inputDeviceSource_->stopPolling();
-    std::cout << "CockpitClientApp: Input Device Source stopped." << std::endl;
+  if (kv.count("target_vehicle_id")) {
+    config->target_vehicle_id = kv["target_vehicle_id"];
   }
-  // Stop WebRTC manager (closes connections, stops threads/tasks)
-  if (webrtcManager_) {
-    webrtcManager_->stop();
-    std::cout << "CockpitClientApp: WebRTC Manager stopped." << std::endl;
+  if (kv.count("control_channel_label")) {
+    config->control_channel_label = kv["control_channel_label"];
   }
-  // Stop local transport server (closes WS, stops HTTP, stops threads/tasks)
-  if (transportServer_) {
-    transportServer_->stop();
-    std::cout << "CockpitClientApp: Transport Server stopped." << std::endl;
+  if (kv.count("telemetry_channel_label")) {
+    config->telemetry_channel_label = kv["telemetry_channel_label"];
   }
 
-  // Handlers (webCommandHandler_, telemetryHandler_) don't typically have
-  // explicit stop methods; they just become inactive when their dependencies
-  // (TransportServer, WebrtcManager) stop.
-
-  // 3. Join event loop thread if it was started in run()
-  // TODO: if (ioThread_ && ioThread_->joinable()) {
-  //     ioThread_->join();
-  //     std::cout << "CockpitClientApp: I/O thread joined." << std::endl;
-  // }
-
-  std::cout << "CockpitClientApp: All components stopped." << std::endl;
-  state_ = AppState::Stopped;  // Final state
-}
-
-// --- Component Setup Methods ---
-
-bool CockpitClientApp::setupWebrtcManagerCallbacks() {
-  std::cout << "CockpitClientApp: Setting up WebrtcManager callbacks..."
-            << std::endl;
-  // webrtcManager_ is validated in init
-  // Use lambdas for cleaner binding, capturing 'this'
-  webrtcManager_->onPeerConnected([this](const std::string& peer_id) {
-    // Ensure this method is thread-safe! Called from WebRTC thread.
-    handlePeerConnected(peer_id);
-  });
-  webrtcManager_->onPeerDisconnected(
-      [this](const std::string& peer_id, const std::string& reason) {
-        // Ensure this method is thread-safe! Called from WebRTC thread.
-        handlePeerDisconnected(peer_id, reason);
-      });
-  // Route DataChannel messages based on label
-  webrtcManager_->onDataChannelMessage(
-      [this](const std::string& peer_id, const std::string& label,
-             const std::vector<char>& message) {
-        // Ensure this method is thread-safe! Called from WebRTC thread.
-        handleWebrtcDataChannelMessageReceived(peer_id, label, message);
-      });
-  webrtcManager_->onError([this](const std::string& error_msg) {
-    // Ensure this method is thread-safe! Called from WebRTC thread.
-    handleWebrtcError(error_msg);
-  });
-  // TODO: If C++ handles video, register video track handler:
-  // webrtcManager_->onVideoTrackReceived([this](const std::string& peer_id,
-  // rtc::scoped_refptr<webrtc::VideoTrackInterface> track) {
-  // // Ensure this method is thread-safe! Called from WebRTC thread.
-  // handleWebrtcVideoTrackReceived(peer_id, track);
-  // });
-
-  std::cout << "CockpitClientApp: WebrtcManager callbacks setup complete."
-            << std::endl;
+  int parsed = 0;
+  if (kv.count("heartbeat_interval_ms") &&
+      to_int(kv["heartbeat_interval_ms"], &parsed)) {
+    config->heartbeat_interval_ms = std::max(100, parsed);
+  }
+  if (kv.count("telemetry_interval_ms") &&
+      to_int(kv["telemetry_interval_ms"], &parsed)) {
+    config->telemetry_interval_ms = std::max(20, parsed);
+  }
+  if (kv.count("connect_delay_ms") && to_int(kv["connect_delay_ms"], &parsed)) {
+    config->connect_delay_ms = std::max(10, parsed);
+  }
   return true;
 }
 
-bool CockpitClientApp::setupTransportServerCallbacks() {
-  std::cout << "CockpitClientApp: Setting up Transport Server callbacks..."
-            << std::endl;
-  // transportServer_ is validated in init
-  // Use lambda capturing 'this'
-  transportServer_->onWebSocketConnected([this](WebSocketConnectionId conn_id) {
-    // Ensure this method is thread-safe! Called from TransportServer thread.
-    handleWsConnected(conn_id);
-  });
-  transportServer_->onWebSocketDisconnected(
-      [this](WebSocketConnectionId conn_id) {
-        // Ensure this method is thread-safe! Called from TransportServer
-        // thread.
-        handleWsDisconnected(conn_id);
-      });
-  transportServer_->onWebSocketMessageReceived(
-      [this](WebSocketConnectionId conn_id, const std::vector<char>& message) {
-        // Ensure this method is thread-safe! Called from TransportServer
-        // thread.
-        handleWsMessageReceived(conn_id, message);
-      });
-  transportServer_->onServerError([this](const std::string& error_msg) {
-    // Ensure this method is thread-safe! Called from TransportServer thread.
-    handleTransportServerError(error_msg);
-  });
-
-  std::cout << "CockpitClientApp: Transport Server callbacks setup complete."
-            << std::endl;
-  return true;
+void publish_status_update(RuntimeState* runtime, const std::string& category,
+                           const std::string& value) {
+  std::lock_guard<std::mutex> lock(runtime->mutex);
+  runtime->stats.status_updates += 1;
+  std::cout << "[cockpit/status] category=" << category << " value=" << value
+            << " session_state=" << runtime->session_state
+            << " ws_clients=" << runtime->ws_clients.size() << std::endl;
 }
 
-bool CockpitClientApp::setupCommandAndInputHandlers() {
-  std::cout
-      << "CockpitClientApp: Setting up Command and Input Handlers/Sources..."
-      << std::endl;
-  // Handlers/Sources require shared_ptrs to WebrtcManager and config, which are
-  // injected. webrtcManager_ is validated in init before this is called.
+void handle_ws_connected(RuntimeState* runtime, int conn_id) {
+  cockpit_domain::OnWsConnected(runtime, conn_id);
+  std::cout << "[cockpit/ws] connected conn_id=" << conn_id << std::endl;
+  publish_status_update(runtime, "ws_connected", std::to_string(conn_id));
+}
 
-  // Initialize WebCommandHandler
-  if (!webCommandHandler_->init(webrtcManager_, config_.control_channel_label,
-                                config_.target_vehicle_id)) {
-    std::cerr << "CockpitClientApp: Failed to initialize Web Command Handler."
-              << std::endl;
+void handle_ws_disconnected(RuntimeState* runtime, int conn_id) {
+  cockpit_domain::OnWsDisconnected(runtime, conn_id);
+  std::cout << "[cockpit/ws] disconnected conn_id=" << conn_id << std::endl;
+  publish_status_update(runtime, "ws_disconnected", std::to_string(conn_id));
+}
+
+void handle_peer_connected(RuntimeState* runtime, const RuntimeConfig& config) {
+  cockpit_domain::OnPeerConnected(runtime);
+
+  std::cout << "[cockpit/peer] connected peer_id=" << config.target_vehicle_id
+            << std::endl;
+  publish_status_update(runtime, "peer", "connected");
+}
+
+void handle_peer_disconnected(RuntimeState* runtime,
+                              const std::string& reason) {
+  cockpit_domain::OnPeerDisconnected(runtime);
+
+  std::cout << "[cockpit/peer] disconnected reason=" << reason << std::endl;
+  publish_status_update(runtime, "peer", "disconnected");
+}
+
+void handle_network_down(RuntimeState* runtime, const std::string& reason) {
+  cockpit_domain::OnNetworkDown(runtime);
+
+  std::cout << "[cockpit/network] down reason=" << reason << std::endl;
+  publish_status_update(runtime, "network", "down");
+}
+
+void handle_network_up(RuntimeState* runtime, const RuntimeConfig& config) {
+  cockpit_domain::OnNetworkUp(runtime);
+
+  std::cout << "[cockpit/network] up target=" << config.target_vehicle_id
+            << std::endl;
+  publish_status_update(runtime, "network", "up");
+}
+
+void handle_heartbeat_lost(RuntimeState* runtime) {
+  cockpit_domain::OnHeartbeatLost(runtime);
+
+  std::cout << "[cockpit/network] heartbeat_lost" << std::endl;
+  publish_status_update(runtime, "network", "heartbeat_lost");
+}
+
+bool process_command(RuntimeState* runtime, const std::string& source,
+                     const std::string& command_name,
+                     const std::string& command_id) {
+  if (!cockpit_domain::ApplyCommand(runtime, source, command_name)) {
     return false;
   }
-  std::cout << "CockpitClientApp: Web Command Handler initialized."
-            << std::endl;
 
-  // Initialize InputDeviceSource
-  // TODO: Pass specific input device config from CockpitConfig
-  if (!inputDeviceSource_->init(
-          webrtcManager_, config_.control_channel_label,
-          config_.target_vehicle_id /*, config_.input_device_config */)) {
-    std::cerr << "CockpitClientApp: Failed to initialize Input Device Source."
-              << std::endl;
-    return false;
+  std::string session_state;
+  double expected_speed_mps = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    session_state = runtime->session_state;
+    expected_speed_mps = runtime->expected_speed_mps;
   }
-  std::cout << "CockpitClientApp: Input Device Source initialized."
-            << std::endl;
-
-  std::cout
-      << "CockpitClientApp: Command and Input Handlers/Sources setup complete."
-      << std::endl;
+  std::cout << "[cockpit/control] source=" << source << " cmd=" << command_name
+            << " cmd_id=" << command_id << " state=" << session_state
+            << " expected_speed_mps=" << expected_speed_mps << std::endl;
   return true;
 }
 
-bool CockpitClientApp::setupTelemetryHandler() {
-  std::cout << "CockpitClientApp: Setting up Telemetry Handler..." << std::endl;
-  // TelemetryHandler requires shared_ptr to TransportServer, which is injected.
-  // transportServer_ is validated in init before this is called.
-  if (!telemetryHandler_->init(transportServer_)) {
-    std::cerr << "CockpitClientApp: Failed to initialize Telemetry Handler."
-              << std::endl;
-    return false;
+std::string parse_web_command_name(const std::string& raw_message) {
+  const auto key_pos = raw_message.find("cmd=");
+  if (key_pos != std::string::npos) {
+    std::string candidate = raw_message.substr(key_pos + 4);
+    const auto sep = candidate.find_first_of(", }\"]");
+    return trim(candidate.substr(0, sep));
   }
-  std::cout << "CockpitClientApp: Telemetry Handler initialized." << std::endl;
-  return true;
-}
 
-bool CockpitClientApp::setupConnectionMonitorCallbacks() {
-  std::cout << "CockpitClientApp: Setting up Connection Monitor callbacks..."
-            << std::endl;
-  if (!connectionMonitor_)
-    return true;  // Optional, just return true if not provided
-  // connectionMonitor_ is validated in init if it exists
-
-  // Set application-level handlers on the monitor
-  // Use lambda capturing 'this'
-  connectionMonitor_->onNetworkUp([this](const std::string& peer_id) {
-    // Ensure this method is thread-safe! Called from ConnectionMonitor thread.
-    handleNetworkUp(peer_id);
-  });
-  connectionMonitor_->onNetworkDown(
-      [this](const std::string& peer_id, const std::string& reason) {
-        // Ensure this method is thread-safe! Called from ConnectionMonitor
-        // thread.
-        handleNetworkDown(peer_id, reason);
-      });
-  connectionMonitor_->onHeartbeatLost([this](const std::string& peer_id) {
-    // Ensure this method is thread-safe! Called from ConnectionMonitor thread.
-    handleHeartbeatLost(peer_id);
-  });
-
-  std::cout << "CockpitClientApp: Connection Monitor callbacks setup complete."
-            << std::endl;
-  return true;
-}
-
-// --- Handlers for WebrtcManager Events (Called by WebrtcManager threads) ---
-// These methods receive events from WebRTC and route them to the appropriate
-// Handlers or update app state/UI.
-
-void CockpitClientApp::handlePeerConnected(const std::string& peer_id) {
-  // This handler is called from WebRTC internal thread. MUST BE THREAD-SAFE.
-  std::cout << "App: Peer " << peer_id << " (Vehicle) connected via WebRTC."
-            << std::endl;
-  // Role: Getting vehicle state -> Notify UI via TelemetryHandler
-  // Role: Sending commands -> Maybe enable controls in UI?
-  // TODO: Update UI status via TelemetryHandler
-  // telemetryHandler_->notifyConnectionStatus(peer_id, true); // Assuming
-  // TelemetryHandler has this method
-
-  // If using ConnectionMonitor, it might trigger NetworkUp handler
-  // If the app auto-connects, maybe trigger offer/answer here?
-  // webrtcManager_->createOffer(...); // Example, depends on WebRTC connection
-  // flow
-}
-
-void CockpitClientApp::handlePeerDisconnected(const std::string& peer_id,
-                                              const std::string& reason) {
-  // This handler is called from WebRTC internal thread. MUST BE THREAD-SAFE.
-  std::cout << "App: Peer " << peer_id
-            << " (Vehicle) disconnected. Reason: " << reason << std::endl;
-  // Role: Getting vehicle state -> Notify UI via TelemetryHandler
-  // Role: Sending commands -> Disable controls in UI?
-  // TODO: Update UI status via TelemetryHandler
-  // telemetryHandler_->notifyConnectionStatus(peer_id, false); // Assuming
-  // TelemetryHandler has this method
-  // TODO: Maybe try to reconnect?
-
-  // If using ConnectionMonitor, it might trigger NetworkDown handler
-}
-
-void CockpitClientApp::handleWebrtcDataChannelMessageReceived(
-    const std::string& peer_id, const std::string& label,
-    const std::vector<char>& message) {
-  // This handler is called from a WebRTC internal thread. MUST BE THREAD-SAFE.
-  // Role: Getting vehicle state -> Receives raw data, deserializes, and routes
-  // to TelemetryHandler std::cout << "App: Received DataChannel message from "
-  // << peer_id << ", label=" << label << ", size=" << message.size() <<
-  // std::endl;
-
-  if (label == config_.telemetry_channel_label) {
-    // Deserialize Protobuf and pass to TelemetryHandler
-    autodev::remote::chassis::Chassis telemetry_data;
-    if (telemetry_data.ParseFromArray(message.data(), message.size())) {
-      // std::cout << "App: Parsed incoming telemetry." << std::endl;
-      // Call TelemetryHandler to process and forward to UI.
-      // TelemetryHandler::processIncomingTelemetry MUST BE THREAD-SAFE.
-      telemetryHandler_->processIncomingTelemetry(peer_id, telemetry_data);
-    } else {
-      std::cerr << "App: Failed to parse telemetry message from " << peer_id
-                << " on label " << label << std::endl;
-      // TODO: Handle parsing error (log, notify UI?)
+  const auto quote_key = raw_message.find("\"cmd\"");
+  if (quote_key != std::string::npos) {
+    const auto colon = raw_message.find(':', quote_key);
+    if (colon != std::string::npos) {
+      auto start = raw_message.find_first_not_of(" \t\r\n\"", colon + 1);
+      if (start != std::string::npos) {
+        auto end = raw_message.find_first_of("\" ,}\r\n\t", start);
+        return trim(raw_message.substr(start, end - start));
+      }
     }
-  } else if (label == config_.control_channel_label) {
-    // This might be loopback if the vehicle echoes control commands
-    // Role: Sending commands -> Is this an echo of commands we sent?
-    // TODO: Decide if loopback needs processing or can be ignored. Typically
-    // ignored. std::cout << "App: Received loopback control message from " <<
-    // peer_id << " (ignored)." << std::endl;
-  } else {
-    std::cout << "App: Received DataChannel message on unknown label: " << label
-              << " from " << peer_id << std::endl;
-    // TODO: Log unexpected message
+  }
+
+  return trim(raw_message);
+}
+
+bool handle_ws_message(RuntimeState* runtime, int conn_id,
+                       const std::string& raw_message,
+                       const std::string& command_id_prefix,
+                       int* command_counter) {
+  const std::string command_name = parse_web_command_name(raw_message);
+
+  std::ostringstream command_id;
+  command_id << command_id_prefix << "-" << (++(*command_counter));
+  std::cout << "[cockpit/ws] message conn_id=" << conn_id << " raw=\""
+            << raw_message << "\" parsed_cmd=" << command_name << std::endl;
+  return process_command(runtime, "web", command_name, command_id.str());
+}
+
+bool handle_input_command(RuntimeState* runtime,
+                          const std::string& command_name,
+                          const std::string& command_id_prefix,
+                          int* command_counter) {
+  std::ostringstream command_id;
+  command_id << command_id_prefix << "-" << (++(*command_counter));
+  return process_command(runtime, "input", command_name, command_id.str());
+}
+
+void connection_loop(RuntimeState* runtime, const RuntimeConfig& config) {
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->session_state = "CONNECTING";
+    cockpit_domain::PushState(runtime, runtime->session_state);
+  }
+  std::cout << "[cockpit/session] connecting target="
+            << config.target_vehicle_id << std::endl;
+
+  std::this_thread::sleep_for(
+      std::chrono::milliseconds(config.connect_delay_ms));
+  if (g_stop_requested) {
+    return;
+  }
+
+  handle_peer_connected(runtime, config);
+
+  while (!g_stop_requested) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 }
 
-void CockpitClientApp::handleWebrtcError(const std::string& error_msg) {
-  // This handler is called from a WebRTC internal thread. MUST BE THREAD-SAFE.
-  std::cerr << "App: WebRTC Error: " << error_msg << std::endl;
-  // TODO: Handle errors (logging, updating UI status, retry logic).
-  // Critical errors might warrant stopping the app or attempting reconnection.
-  // telemetryHandler_->notifyWebrtcError(error_msg); // Assuming
-  // TelemetryHandler can notify UI
+void heartbeat_loop(RuntimeState* runtime, const RuntimeConfig& config) {
+  const auto interval = std::chrono::milliseconds(config.heartbeat_interval_ms);
+  while (!g_stop_requested) {
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->stats.heartbeats += 1;
+      std::cout << "[cockpit/heartbeat] client_id=" << config.client_id
+                << " target=" << config.target_vehicle_id
+                << " state=" << runtime->session_state << std::endl;
+    }
+    std::this_thread::sleep_for(interval);
+  }
 }
 
-// --- Optional: Handler for incoming video tracks if C++ processes them (Called
-// by WebRTC threads) --- Role: Serving UI/Video/Telemetry -> Receive video
-// track and send frames to UI void
-// CockpitClientApp::handleWebrtcVideoTrackReceived(const std::string& peer_id,
-// rtc::scoped_refptr<webrtc::VideoTrackInterface> track) {
-//     // This handler is called from a WebRTC internal thread. MUST BE
-//     THREAD-SAFE. std::cout << "App: Received video track from " << peer_id <<
-//     std::endl;
-//     // TODO: Implement logic to get frames from the track and send them to
-//     // the display via TransportServer. This is complex and often involves a
-//     custom
-//     // VideoSink implementation that attaches to the track and uses the
-//     TransportServer
-//     // (or a dedicated video streaming part of it) to send frames to the UI.
-//     // telemetryHandler_->addVehicleVideoTrack(peer_id, track); // Assuming
-//     TelemetryHandler handles video display via TransportServer
-// }
+void telemetry_loop(RuntimeState* runtime, const RuntimeConfig& config) {
+  const auto interval = std::chrono::milliseconds(config.telemetry_interval_ms);
+  while (!g_stop_requested) {
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      if (runtime->connected) {
+        runtime->stats.telemetry_received += 1;
+        runtime->stats.telemetry_broadcasts +=
+            static_cast<int>(runtime->ws_clients.size());
 
-// --- Handlers for TransportServer (WebSocket) Events (Called by
-// TransportServer threads) --- These methods receive events from the local UI
-// via WebSocket and route messages to the CommandHandler.
+        std::cout << "[cockpit/telemetry] vehicle_mode="
+                  << runtime->vehicle_mode
+                  << " speed_mps=" << runtime->expected_speed_mps
+                  << " emergency=" << (runtime->emergency ? "true" : "false")
+                  << " ws_clients=" << runtime->ws_clients.size() << std::endl;
+      }
+    }
+    std::this_thread::sleep_for(interval);
+  }
+}
 
-void CockpitClientApp::handleWsConnected(WebSocketConnectionId conn_id) {
-  // This handler is called from a TransportServer internal thread. MUST BE
-  // THREAD-SAFE.
-  std::cout << "App: WebSocket client connected (ID " << conn_id << ")"
+bool run_self_test(RuntimeState* runtime, const RuntimeConfig& config) {
+  while (!g_stop_requested) {
+    bool ready = false;
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      ready = runtime->connected;
+    }
+    if (ready) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  if (g_stop_requested) {
+    return false;
+  }
+
+  int command_counter = 0;
+  const int ws_conn = 101;
+
+  handle_ws_connected(runtime, ws_conn);
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+  if (!handle_ws_message(runtime, ws_conn, "cmd=TAKEOVER_REQUEST", "web",
+                         &command_counter)) {
+    std::cerr << "Self-test failed: web TAKEOVER_REQUEST" << std::endl;
+    return false;
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  if (!handle_input_command(runtime, "FORWARD", "input", &command_counter)) {
+    std::cerr << "Self-test failed: input FORWARD" << std::endl;
+    return false;
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  if (!handle_ws_message(runtime, ws_conn, "{\"cmd\":\"STOP\"}", "web",
+                         &command_counter)) {
+    std::cerr << "Self-test failed: web STOP" << std::endl;
+    return false;
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  if (!handle_ws_message(runtime, ws_conn, "cmd=EMERGENCY_STOP", "web",
+                         &command_counter)) {
+    std::cerr << "Self-test failed: web EMERGENCY_STOP" << std::endl;
+    return false;
+  }
+
+  handle_network_down(runtime, "link_lost");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  handle_network_up(runtime, config);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  if (!handle_input_command(runtime, "RECOVER_AUTO", "input",
+                            &command_counter)) {
+    std::cerr << "Self-test failed: input RECOVER_AUTO" << std::endl;
+    return false;
+  }
+
+  handle_heartbeat_lost(runtime);
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  if (!handle_ws_message(runtime, ws_conn, "cmd=RECOVER_AUTO", "web",
+                         &command_counter)) {
+    std::cerr << "Self-test failed: web RECOVER_AUTO after heartbeat_lost"
+              << std::endl;
+    return false;
+  }
+
+  handle_peer_disconnected(runtime, "peer_reset");
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  handle_peer_connected(runtime, config);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  handle_ws_disconnected(runtime, ws_conn);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  RuntimeStats stats;
+  std::string final_state;
+  std::string vehicle_mode;
+  bool emergency = false;
+  bool connected = false;
+  size_t ws_clients = 0;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    stats = runtime->stats;
+    final_state = runtime->session_state;
+    vehicle_mode = runtime->vehicle_mode;
+    emergency = runtime->emergency;
+    connected = runtime->connected;
+    ws_clients = runtime->ws_clients.size();
+  }
+
+  const std::vector<std::string> expected_states = {
+      "DISCONNECTED", "CONNECTING",   "CONNECTED",    "REMOTE_CONTROL",
+      "SAFE_STOP",    "RECONNECTING", "SAFE_STOP",    "CONNECTED",
+      "SAFE_STOP",    "CONNECTED",    "DISCONNECTED", "CONNECTED"};
+
+  size_t cursor = 0;
+  for (const auto& state : stats.state_timeline) {
+    if (cursor < expected_states.size() && state == expected_states[cursor]) {
+      ++cursor;
+    }
+  }
+
+  bool ok = true;
+  ok = ok && (stats.heartbeats > 0);
+  ok = ok && (stats.telemetry_received >= 3);
+  ok = ok && (stats.telemetry_broadcasts > 0);
+  ok = ok && (stats.commands_sent >= 6);
+  ok = ok && (stats.command_acks >= 6);
+  ok = ok && (stats.ws_connected_events >= 1);
+  ok = ok && (stats.ws_disconnected_events >= 1);
+  ok = ok && (stats.ws_messages_received >= 4);
+  ok = ok && (stats.input_commands_received >= 2);
+  ok = ok && (stats.peer_connected_events >= 2);
+  ok = ok && (stats.peer_disconnected_events >= 1);
+  ok = ok && (stats.network_up_events >= 1);
+  ok = ok && (stats.network_down_events >= 1);
+  ok = ok && (stats.heartbeat_lost_events >= 1);
+  ok = ok && (stats.status_updates >= 5);
+  ok = ok && (cursor == expected_states.size());
+  ok = ok && connected;
+  ok = ok && (final_state == "CONNECTED");
+  ok = ok && (vehicle_mode == "AUTO");
+  ok = ok && (!emergency);
+  ok = ok && (ws_clients == 0);
+
+  if (!ok) {
+    std::cerr << "Cockpit self-test failed. heartbeats=" << stats.heartbeats
+              << " telemetry_received=" << stats.telemetry_received
+              << " telemetry_broadcasts=" << stats.telemetry_broadcasts
+              << " commands_sent=" << stats.commands_sent
+              << " command_acks=" << stats.command_acks
+              << " ws_connected_events=" << stats.ws_connected_events
+              << " ws_disconnected_events=" << stats.ws_disconnected_events
+              << " ws_messages_received=" << stats.ws_messages_received
+              << " input_commands_received=" << stats.input_commands_received
+              << " peer_connected_events=" << stats.peer_connected_events
+              << " peer_disconnected_events=" << stats.peer_disconnected_events
+              << " network_up_events=" << stats.network_up_events
+              << " network_down_events=" << stats.network_down_events
+              << " heartbeat_lost_events=" << stats.heartbeat_lost_events
+              << " status_updates=" << stats.status_updates
+              << " connected=" << (connected ? "true" : "false")
+              << " final_state=" << final_state
+              << " vehicle_mode=" << vehicle_mode
+              << " emergency=" << (emergency ? "true" : "false")
+              << " ws_clients=" << ws_clients << std::endl;
+    std::cerr << "state_timeline:";
+    for (const auto& state : stats.state_timeline) {
+      std::cerr << " " << state;
+    }
+    std::cerr << std::endl;
+    return false;
+  }
+
+  std::cout << "COCKPIT_SELF_TEST_PASS heartbeats=" << stats.heartbeats
+            << " telemetry_received=" << stats.telemetry_received
+            << " command_acks=" << stats.command_acks << std::endl;
+  std::cout << "COCKPIT_LEGACY_FEATURES_PASS ws_messages="
+            << stats.ws_messages_received
+            << " input_commands=" << stats.input_commands_received
+            << " network_events="
+            << (stats.network_up_events + stats.network_down_events +
+                stats.heartbeat_lost_events)
+            << " telemetry_broadcasts=" << stats.telemetry_broadcasts
             << std::endl;
-  // Role: Serving UI/Video/Telemetry -> Manage connected UI clients, send
-  // initial state
-  // TODO: If only one display client is supported, store this ID. If multiple,
-  // track them (e.g., in TelemetryHandler).
-  // telemetryHandler_->addClient(conn_id); // Assuming TelemetryHandler tracks
-  // clients Send initial state/config to the newly connected UI client via
-  // TelemetryHandler. telemetryHandler_->sendInitialState(conn_id); // Assuming
-  // TelemetryHandler has this method
+  return true;
 }
 
-void CockpitClientApp::handleWsDisconnected(WebSocketConnectionId conn_id) {
-  // This handler is called from a TransportServer internal thread. MUST BE
-  // THREAD-SAFE.
-  std::cout << "App: WebSocket client disconnected (ID " << conn_id << ")"
-            << std::endl;
-  // Role: Serving UI/Video/Telemetry -> Manage connected UI clients
-  // TODO: Remove from active connections map in
-  // TelemetryHandler/TransportServer. telemetryHandler_->removeClient(conn_id);
-  // // Assuming TelemetryHandler tracks clients
-}
+}  // namespace
 
-void CockpitClientApp::handleWsMessageReceived(
-    WebSocketConnectionId conn_id, const std::vector<char>& message) {
-  // This handler is called from a TransportServer internal thread. MUST BE
-  // THREAD-SAFE. Role: Sending commands -> Receives raw message from UI and
-  // routes to WebCommandHandler std::cout << "App: Received WebSocket message
-  // from " << conn_id << ", size=" << message.size() << std::endl; Call
-  // WebCommandHandler to process the raw message.
-  // WebCommandHandler::processRawWebCommand MUST BE THREAD-SAFE.
-  webCommandHandler_->processRawWebCommand(conn_id, message);
-}
+int main(int argc, char** argv) {
+  std::string config_path;
+  bool show_help = false;
+  bool self_test = false;
+  int run_seconds = 0;
 
-void CockpitClientApp::handleTransportServerError(
-    const std::string& error_msg) {
-  // This handler is called from a TransportServer internal thread. MUST BE
-  // THREAD-SAFE.
-  std::cerr << "App: Transport Server Error: " << error_msg << std::endl;
-  // Role: Serving UI/Video/Telemetry -> Report critical server errors
-  // TODO: Handle server errors (logging, attempt restart? Notify UI?).
-  // A critical transport server error might mean the UI can no longer connect.
-  // Consider stopping the application gracefully or transitioning to an error
-  // state. telemetryHandler_->notifyServerError(error_msg); // Assuming
-  // TelemetryHandler can notify UI stop(); // Example: stop the app on severe
-  // server error
-}
-
-// --- Handlers for ConnectionMonitor Events (Optional, Called by
-// ConnectionMonitor thread) --- These methods receive network status updates
-// and route them to the UI.
-
-void CockpitClientApp::handleNetworkUp(const std::string& peer_id) {
-  // This handler is called from the ConnectionMonitor thread. MUST BE
-  // THREAD-SAFE.
-  std::cout << "App: Network is UP with peer " << peer_id << std::endl;
-  // Role: Getting vehicle state -> Update UI status via TelemetryHandler
-  // telemetryHandler_->notifyNetworkStatus(peer_id, true); // Assuming
-  // TelemetryHandler has this method
-}
-
-void CockpitClientApp::handleNetworkDown(const std::string& peer_id,
-                                         const std::string& reason) {
-  // This handler is called from the ConnectionMonitor thread. MUST BE
-  // THREAD-SAFE.
-  std::cerr << "App: Network is DOWN with peer " << peer_id
-            << ". Reason: " << reason << std::endl;
-  // Role: Getting vehicle state -> Update UI status via TelemetryHandler
-  // Role: Sending commands -> Disable controls in UI, potentially trigger
-  // safety action on vehicle? The safety action should ideally be handled by
-  // the vehicle itself based on heartbeat loss, but the cockpit might also
-  // signal it or update UI state.
-  // telemetryHandler_->notifyNetworkStatus(peer_id, false, reason); // Assuming
-  // TelemetryHandler has this method commandHandler_->disableControls("Network
-  // Down"); // Assuming CommandHandler can send a safety command or disable UI
-  // controls internally - Note: This would call webCommandHandler_ or
-  // inputDeviceSource_ depending on which can trigger safety actions? Or
-  // perhaps a new safety_handler? Rethink safety action trigger flow.
-}
-
-void CockpitClientApp::handleHeartbeatLost(const std::string& peer_id) {
-  // This handler is called from the ConnectionMonitor thread. MUST BE
-  // THREAD-SAFE.
-  std::cerr << "App: Heartbeat lost from peer " << peer_id << std::endl;
-  // Role: Getting vehicle state -> Update UI status via TelemetryHandler
-  // Role: Sending commands -> Trigger safety action, disable controls
-  // telemetryHandler_->notifyHeartbeatStatus(peer_id, false); // Assuming
-  // TelemetryHandler has this method
-  // commandHandler_->triggerEmergencyStop("Heartbeat Lost"); // Assuming
-  // CommandHandler can send emergency command or disable UI controls internally
-  // - Similar note as NetworkDown regarding safety trigger.
-}
-
-}  // namespace cockpit
-}  // namespace remote
-}  // namespace autodev
-
-// --- Main Application Entry Point ---
-
-// Define the global pointer in the global namespace, outside the autodev
-// namespace. This pointer is used by the signal handler to access the
-// application instance.
-CockpitClientApp* global_app_instance =
-    nullptr;  // Use forward declaration in .h
-
-int main(int argc, char* argv[]) {
-  // Set up signal handlers for graceful shutdown (Ctrl+C, etc.)
-  // Using a global instance is one common pattern for this.
-  // Consider integrating signal handling directly with your event loop (e.g.,
-  // Asio's signal_set) for a potentially cleaner approach, especially in
-  // multi-threaded apps.
-  std::signal(SIGINT, signal_handler);   // Ctrl+C
-  std::signal(SIGTERM, signal_handler);  // Termination signal
-  // Ignore SIGPIPE if writing to disconnected sockets (e.g., broken WebSocket
-  // connection)
-  std::signal(SIGPIPE, SIG_IGN);
-
-  if (argc < 2) {
-    std::cerr << "Usage: " << argv[0] << " <config_file_path>" << std::endl;
-    return 1;
+  for (int index = 1; index < argc; ++index) {
+    std::string arg = argv[index];
+    if (arg == "--help" || arg == "-h") {
+      show_help = true;
+      break;
+    }
+    if (arg == "--self-test") {
+      self_test = true;
+      continue;
+    }
+    if (arg == "--run-seconds" && index + 1 < argc) {
+      int parsed = 0;
+      if (!to_int(argv[++index], &parsed)) {
+        std::cerr << "Invalid value for --run-seconds" << std::endl;
+        return 2;
+      }
+      run_seconds = std::max(0, parsed);
+      continue;
+    }
+    if (arg == "--config" && index + 1 < argc) {
+      config_path = argv[++index];
+      continue;
+    }
+    if (!arg.empty() && arg[0] != '-') {
+      config_path = arg;
+      continue;
+    }
+    std::cerr << "Unknown argument: " << arg << std::endl;
+    return 2;
   }
 
-  std::string config_path = argv[1];
-
-  // 1. Load Configuration (Done outside the App for dependency injection)
-  // Use the concrete loader implementation
-  autodev::remote::config::JsonConfigLoader config_loader;
-  auto loaded_config = config_loader.loadConfig(
-      config_path);  // Assuming loader can load CockpitConfig
-  if (!loaded_config) {
-    std::cerr << "Failed to load configuration from " << config_path
+  if (show_help) {
+    std::cout << "Usage: cockpit_client_app --config <path> [--self-test] "
+                 "[--run-seconds N]"
               << std::endl;
-    return 1;
+    return 0;
   }
-  // Get the loaded config structure
-  autodev::remote::cockpit::CockpitConfig app_config = *loaded_config;
-  std::cout << "Configuration loaded successfully." << std::endl;
 
-  // TODO: 2. Create Event Loop Context (if owned by main or passed to
-  // components) auto io_context = std::make_shared<boost::asio::io_context>();
-  // // Or unique_ptr if app owns it
+  if (config_path.empty()) {
+    std::cerr << "Missing required config path." << std::endl;
+    return 2;
+  }
 
-  // 3. Create Concrete Component Instances (Done outside the App)
-  // Instantiate concrete classes based on configuration or default.
-  // Use appropriate smart pointers as defined in CockpitClientApp.h
-  // Dependencies are passed to init, their configuration might come from
-  // app_config.
-  auto webrtc_manager = std::make_shared<
-      autodev::remote::webrtc::WebrtcManagerImpl>();  // Needs config and
-                                                      // io_context?
-  auto transport_server = std::make_shared<
-      autodev::remote::transport::WebSocketTransportServer>();  // Needs config
-                                                                // and
-                                                                // io_context?
+  if (!std::filesystem::exists(config_path)) {
+    std::cerr << "Config file not found: " << config_path << std::endl;
+    return 3;
+  }
 
-  // Create Handlers/Sources for commands and telemetry
-  // They need shared_ptrs to webrtc_manager and transport_server, and
-  // configuration
-  auto web_command_handler = std::make_unique<
-      autodev::remote::drivers::WebCommandHandlerImpl>();  // Needs
-                                                           // webrtc_manager,
-                                                           // config
-  // TODO: Create InputDeviceSourceImpl based on config_.input_device_config
-  auto input_device_source = std::make_unique<
-      autodev::remote::drivers::InputDeviceSourceImpl>();  // Needs
-                                                           // webrtc_manager,
-                                                           // config, specific
-                                                           // device config
-  auto telemetry_handler = std::make_unique<
-      autodev::remote::drivers::TelemetryHandlerImpl>();  // Needs
-                                                          // transport_server
+  RuntimeConfig config;
+  if (!load_config(config_path, &config)) {
+    return 4;
+  }
 
-  // Create Connection Monitor only if heartbeat is configured and WebrtcManager
-  // is available
-  std::unique_ptr<autodev::remote::network_manager::IConnectionMonitor>
-      connection_monitor = nullptr;
-  if (app_config.heartbeat_interval_ms > 0 && webrtc_manager) {
-    // Connection Monitor needs WebrtcManager and config
-    // TODO: It also needs io_context to run its timer/logic
-    connection_monitor = std::make_unique<
-        autodev::remote::network_manager::ConnectionMonitorImpl>(
-        webrtc_manager,
-        app_config
-            .heartbeat_interval_ms);  // Assuming MonitorImpl takes shared_ptr
-                                      // to WebrtcManager and interval
-    std::cout << "Connection Monitor created." << std::endl;
+  g_stop_requested = false;
+  std::signal(SIGINT, signal_handler);
+  std::signal(SIGTERM, signal_handler);
+
+  RuntimeState runtime;
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    cockpit_domain::PushState(&runtime, runtime.session_state);
+  }
+
+  std::cout << "Cockpit client started. role=cockpit client_id="
+            << config.client_id << " target=" << config.target_vehicle_id
+            << " config=" << config_path << std::endl;
+
+  std::thread session_thread(connection_loop, &runtime, std::cref(config));
+  std::thread heartbeat_thread(heartbeat_loop, &runtime, std::cref(config));
+  std::thread telemetry_thread(telemetry_loop, &runtime, std::cref(config));
+
+  bool success = true;
+  if (self_test) {
+    success = run_self_test(&runtime, config);
+    g_stop_requested = true;
+  } else if (run_seconds > 0) {
+    std::this_thread::sleep_for(std::chrono::seconds(run_seconds));
+    g_stop_requested = true;
   } else {
-    std::cout << "Heartbeat interval <= 0 or WebrtcManager not available, "
-                 "Connection Monitor not created."
-              << std::endl;
+    while (!g_stop_requested) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
   }
 
-  // 4. Create and Initialize the Application with Dependencies
-  autodev::remote::cockpit::CockpitClientApp app;
-  // Set global instance BEFORE init, in case init fails and destructor is
-  // called
-  global_app_instance = &app;
+  session_thread.join();
+  heartbeat_thread.join();
+  telemetry_thread.join();
 
-  if (!app.init(app_config, std::move(webrtc_manager),
-                std::move(transport_server),
-                std::move(web_command_handler),  // Pass web command handler
-                std::move(input_device_source),  // Pass input device source
-                std::move(telemetry_handler), std::move(connection_monitor)
-                // TODO: Pass io_context here
-                )) {
-    std::cerr << "Failed to initialize cockpit client application."
-              << std::endl;
-    global_app_instance = nullptr;  // Clear global pointer on failure
-    return 1;
+  RuntimeStats stats;
+  std::string final_state;
+  std::string final_mode;
+  bool emergency = false;
+  size_t ws_clients = 0;
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    stats = runtime.stats;
+    final_state = runtime.session_state;
+    final_mode = runtime.vehicle_mode;
+    emergency = runtime.emergency;
+    ws_clients = runtime.ws_clients.size();
   }
 
-  std::cout << "Cockpit client initialized. Running..." << std::endl;
+  std::cout << "Cockpit client stopped. state=" << final_state
+            << " vehicle_mode=" << final_mode
+            << " emergency=" << (emergency ? "true" : "false")
+            << " ws_clients=" << ws_clients
+            << " heartbeats=" << stats.heartbeats
+            << " telemetry_received=" << stats.telemetry_received
+            << " telemetry_broadcasts=" << stats.telemetry_broadcasts
+            << " command_acks=" << stats.command_acks << std::endl;
 
-  // 5. Run the Application (delegates to event loop)
-  // This method should block and manage the event loop.
-  int return_code = app.run();
-
-  std::cout << "Cockpit client stopped." << std::endl;
-  global_app_instance = nullptr;  // Clear global pointer on exit
-  return return_code;
+  return success ? 0 : 5;
 }

@@ -195,6 +195,11 @@ class LibwebrtcPeerConnectionImpl
   // Store the application's callbacks
   PeerConnectionCallbacks callbacks_ GUARDED_BY(mutex_);
 
+  // Local SDP is only emitted after SetLocalDescription succeeds.
+  bool awaiting_local_set_description_ GUARDED_BY(mutex_) = false;
+  std::string pending_local_sdp_type_ GUARDED_BY(mutex_);
+  std::string pending_local_sdp_string_ GUARDED_BY(mutex_);
+
   // Map to store DataChannel instances, potentially keyed by label
   // std::map<std::string, rtc::scoped_refptr<webrtc::DataChannelInterface>>
   // data_channels_ GUARDED_BY(mutex_); Need to manage DataChannelObservers
@@ -303,7 +308,7 @@ void LibwebrtcPeerConnectionImpl::SetCallbacks(
 }
 
 // Implementation of IPeerConnection::CreateOffer
-bool LibwebrConnectionImpl::CreateOffer() {
+bool LibwebrtcPeerConnectionImpl::CreateOffer() {
   // This method is called by the WebrtcManager's thread. Acquire mutex.
   std::lock_guard<std::mutex> lock(mutex_);
   std::cout << "LibwebrtcPeerConnectionImpl::CreateOffer called." << std::endl;
@@ -789,20 +794,34 @@ void LibwebrtcPeerConnectionImpl::OnSuccess(
   std::lock_guard<std::mutex> lock(mutex_);
   std::cout << "LibwebrtcPeerConnectionImpl: CreateSdp OnSuccess" << std::endl;
 
+  if (!desc) {
+    std::cerr << "LibwebrtcPeerConnectionImpl: CreateSdp OnSuccess with null "
+                 "description."
+              << std::endl;
+    return;
+  }
+
   // Get SDP string
   std::string sdp_string;
   desc->ToString(&sdp_string);
   std::string sdp_type = desc->type();  // "offer" or "answer"
 
-  // Set local description (required after creating Offer/Answer)
-  // rtc_peer_connection_->SetLocalDescription(this, desc); // Pass 'this' as
-  // SetSessionDescriptionObserver
+  pending_local_sdp_type_ = sdp_type;
+  pending_local_sdp_string_ = sdp_string;
+  awaiting_local_set_description_ = true;
 
-  // Invoke application callback (safely). This calls
-  // handlePeerLocalSdpGenerated in WebrtcManager. Need to marshal this call to
-  // the application thread. PostTaskToAppThread([this, sdp_type, sdp_string]()
-  // { callbacks_.onLocalSdpGenerated(sdp_type, sdp_string); }); // Conceptual
-  // marshalling
+  if (!rtc_peer_connection_) {
+    std::cerr << "LibwebrtcPeerConnectionImpl: Cannot SetLocalDescription, "
+                 "underlying PC not initialized."
+              << std::endl;
+    awaiting_local_set_description_ = false;
+    pending_local_sdp_type_.clear();
+    pending_local_sdp_string_.clear();
+    return;
+  }
+
+  // Set local description (required after creating Offer/Answer)
+  rtc_peer_connection_->SetLocalDescription(this, desc);
 
   // Note: Ownership of `desc` is transferred to SetLocalDescription.
 }
@@ -821,19 +840,38 @@ void LibwebrtcPeerConnectionImpl::OnFailure(webrtc::RTCError error) {
 
 void LibwebrtcPeerConnectionImpl::OnSetSessionDescriptionComplete(
     webrtc::RTCError error) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cout << "LibwebrtcPeerConnectionImpl: SetSdp OnComplete" << std::endl;
-  if (!error.ok()) {
-    std::cerr << "LibwebrtcPeerConnectionImpl: SetSdp failed: "
-              << error.message() << std::endl;
-    // TODO: Invoke callbacks_->onError("Set SDP failed: " + error.message());
-    // // Need to marshal
-  } else {
+  std::string local_sdp_type;
+  std::string local_sdp_string;
+  std::function<void(const std::string&, const std::string&)> local_sdp_cb;
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cout << "LibwebrtcPeerConnectionImpl: SetSdp OnComplete" << std::endl;
+    if (!error.ok()) {
+      std::cerr << "LibwebrtcPeerConnectionImpl: SetSdp failed: "
+                << error.message() << std::endl;
+      if (awaiting_local_set_description_) {
+        awaiting_local_set_description_ = false;
+        pending_local_sdp_type_.clear();
+        pending_local_sdp_string_.clear();
+      }
+      return;
+    }
+
     std::cout << "LibwebrtcPeerConnectionImpl: SetSdp success." << std::endl;
-    // SetLocalDescription success might trigger ICE gathering.
-    // SetRemoteDescription success (for offer) might trigger answer creation if
-    // needed. SetRemoteDescription success (for answer) might trigger ICE
-    // candidate exchange completion.
+
+    if (awaiting_local_set_description_) {
+      awaiting_local_set_description_ = false;
+      local_sdp_type = pending_local_sdp_type_;
+      local_sdp_string = pending_local_sdp_string_;
+      pending_local_sdp_type_.clear();
+      pending_local_sdp_string_.clear();
+      local_sdp_cb = callbacks_.onLocalSdpGenerated;
+    }
+  }
+
+  if (local_sdp_cb) {
+    local_sdp_cb(local_sdp_type, local_sdp_string);
   }
 }
 // Implement older OnSetSessionDescriptionSuccess/Failure if needed based on

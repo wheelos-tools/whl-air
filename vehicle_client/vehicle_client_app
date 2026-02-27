@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CALLER_DIR="$PWD"
+
+args=("$@")
+for ((i=0; i<${#args[@]}; ++i)); do
+	if [[ "${args[$i]}" == "--config" ]] && [[ $((i+1)) -lt ${#args[@]} ]]; then
+		cfg="${args[$((i+1))]}"
+		if [[ "$cfg" != /* ]]; then
+			args[$((i+1))]="$(realpath -m "$CALLER_DIR/$cfg")"
+		fi
+	fi
+done
+
+cd "$ROOT_DIR"
+
+exec bazel run //:vehicle_client_app_bin -- "${args[@]}"

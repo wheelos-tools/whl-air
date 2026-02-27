@@ -1,0 +1,7 @@
+# required snippets in proto/remote_command.proto
+message EmergencyCommand
+EmergencyType type = 1;
+string reason = 2;
+enum EmergencyType
+EMERGENCY_STOP = 1;
+PULL_OVER = 2;

@@ -5,7 +5,7 @@
 #include <memory>  // For smart pointers
 #include <string>
 
-#include "signaling_message.h"
+#include "signaling/signaling_message.h"
 
 class SignalingClient {
  public:

@@ -1,0 +1,25 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "webrtc_headers",
+    hdrs = [
+        "i_peer_connection.h",
+        "i_webrtc_manager.h",
+        "peer_connection.h",
+        "peer_connection_callbacks.h",
+        "webrtc_manager.h",
+    ],
+    deps = ["//signaling:signaling_headers"],
+)
+
+cc_library(
+    name = "webrtc_manager_lib",
+    srcs = ["webrtc_manager.cc"],
+    hdrs = ["webrtc_manager.h"],
+    copts = ["-std=c++17"],
+    deps = [
+        "//signaling:signaling_client_base_lib",
+        "//signaling:signaling_message_lib",
+        ":webrtc_headers",
+    ],
+)
