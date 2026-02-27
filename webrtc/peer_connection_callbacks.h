@@ -7,16 +7,16 @@
 #include <vector>
 
 // Include definitions for state enums and DataChannelMessage
-#include "i_peer_connection.h"
+#include "webrtc/i_peer_connection.h"
 
-// Include WebRTC specific types for media tracks if needed by callbacks (e.g.,
-// OnAddTrack) Requires including relevant libwebrtc headers or defining aliases
-// if not using raw libwebrtc types
-#include "webrtc/api/media_stream_interface.h"  // For webrtc::MediaStreamInterface, webrtc::VideoTrackInterface
-#include "webrtc/rtc_base/scoped_refptr.h"  // For rtc::scoped_refptr
-// Note: Including these headers directly ties this struct to libwebrtc types.
-// An alternative is to use a more abstract representation of tracks, but this
-// is simpler if libwebrtc is the only impl.
+namespace rtc {
+template <typename T>
+class scoped_refptr;
+}
+
+namespace webrtc {
+class VideoTrackInterface;
+}
 
 namespace autodev {
 namespace remote {
@@ -96,7 +96,7 @@ struct PeerConnectionCallbacks {
   // requires careful lifetime management and potentially adding a VideoSink to
   // the track on the application thread. This callback might need to be
   // marshalled.
-  std::function<void(rtc::scoped_refptr<webrtc::VideoTrackInterface> track)>
+  std::function<void(rtc::scoped_refptr<::webrtc::VideoTrackInterface> track)>
       onAddVideoTrack;  // Added (Simplified for video)
 
   // Called when the PeerConnection needs renegotiation (e.g., due to

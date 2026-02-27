@@ -1,0 +1,20 @@
+# signaling envelope contract cases
+# fields: name,shape,from,to,candidate,sdp_mid,sdp_mline_index
+
+[case]
+name=envelope_candidate_case
+shape=envelope
+from=cockpit_contract_a
+to=vehicle_contract_a
+candidate=candidate:abc
+sdp_mid=0
+sdp_mline_index=4
+
+[case]
+name=direct_candidate_case
+shape=direct
+from=cockpit_contract_b
+to=vehicle_contract_b
+candidate=candidate:def
+sdp_mid=1
+sdp_mline_index=9

@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTC Takeover Safety Validation</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    button { margin-right: 8px; padding: 8px 12px; }
+    .row { display: flex; gap: 16px; margin-top: 12px; }
+    video, canvas { width: 360px; height: 240px; background: #111; border-radius: 6px; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 6px; min-height: 220px; }
+    .ok { color: #0a7f2e; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h2>Takeover & Safety State Validation</h2>
+  <p>Validates mode transition chain: AUTO → REMOTE_CONTROL → SAFE_STOP → AUTO_RECOVERED, with video + command + telemetry checks.</p>
+
+  <div>
+    <button id="btnRun">Run Takeover Test</button>
+    <button id="btnReset">Reset</button>
+    <span id="status">Idle</span>
+  </div>
+
+  <div class="row">
+    <div>
+      <h4>Mock Vehicle Video Source</h4>
+      <canvas id="mockCanvas" width="640" height="360"></canvas>
+    </div>
+    <div>
+      <h4>Cockpit Remote Video</h4>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <h3>Stats</h3>
+  <pre id="stats"></pre>
+
+  <h3>Log</h3>
+  <pre id="log"></pre>
+
+  <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+  <script>
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const statsEl = document.getElementById('stats');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const mockCanvas = document.getElementById('mockCanvas');
+
+    let pcCockpit = null;
+    let pcVehicle = null;
+    let controlTx = null;
+    let controlRx = null;
+    let telemetryTx = null;
+    let telemetryRx = null;
+    let mockStream = null;
+    let drawTimer = null;
+    let telemetryTimer = null;
+
+    const modeTimeline = [];
+    const commandLatencyMs = [];
+    const commandSendTs = new Map();
+    let cmdSeq = 0;
+
+    function log(msg, cls = '') {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      if (cls) line.className = cls;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg, cls = '') {
+      statusEl.textContent = msg;
+      statusEl.className = cls;
+    }
+
+    function wait(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function p95(values) {
+      if (!values.length) return Number.NaN;
+      const sorted = [...values].sort((a, b) => a - b);
+      return sorted[Math.ceil(sorted.length * 0.95) - 1];
+    }
+
+    function renderStats() {
+      const values = [
+        `mode.timeline=${modeTimeline.join(' -> ') || '(none)'}`,
+        `control.ackCount=${commandLatencyMs.length}`,
+        `control.ackP95Ms=${Number.isFinite(p95(commandLatencyMs)) ? p95(commandLatencyMs).toFixed(1) : 'N/A'}`,
+      ];
+      statsEl.textContent = values.join('\n');
+      window.__validationMetrics = {
+        modeTimeline: [...modeTimeline],
+        ackCount: commandLatencyMs.length,
+        ackP95Ms: Number.isFinite(p95(commandLatencyMs)) ? p95(commandLatencyMs) : null,
+      };
+    }
+
+    function startMockVideo() {
+      const ctx = mockCanvas.getContext('2d');
+      const begin = performance.now();
+      const draw = () => {
+        const t = (performance.now() - begin) / 1000;
+        const w = mockCanvas.width;
+        const h = mockCanvas.height;
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#22d3ee';
+        ctx.fillRect(Math.floor((Math.sin(t) * 0.45 + 0.5) * (w - 130)), Math.floor((Math.cos(t * 0.8) * 0.35 + 0.5) * (h - 80)), 130, 80);
+        ctx.fillStyle = '#f1f5f9';
+        ctx.font = '26px sans-serif';
+        ctx.fillText('TAKEOVER TEST FEED', 20, 40);
+      };
+      draw();
+      drawTimer = setInterval(draw, 33);
+      mockStream = mockCanvas.captureStream(30);
+      return mockStream;
+    }
+
+    function cleanup() {
+      try { if (controlTx) controlTx.close(); } catch {}
+      try { if (controlRx) controlRx.close(); } catch {}
+      try { if (telemetryTx) telemetryTx.close(); } catch {}
+      try { if (telemetryRx) telemetryRx.close(); } catch {}
+      try { if (pcCockpit) pcCockpit.close(); } catch {}
+      try { if (pcVehicle) pcVehicle.close(); } catch {}
+      if (drawTimer) clearInterval(drawTimer);
+      if (telemetryTimer) clearInterval(telemetryTimer);
+      drawTimer = null;
+      telemetryTimer = null;
+      if (mockStream) {
+        for (const track of mockStream.getTracks()) track.stop();
+      }
+      mockStream = null;
+      remoteVideo.srcObject = null;
+      modeTimeline.length = 0;
+      commandLatencyMs.length = 0;
+      commandSendTs.clear();
+      cmdSeq = 0;
+      renderStats();
+    }
+
+    async function setupPeer(onBeforeOffer) {
+      pcCockpit = new RTCPeerConnection({ iceServers: [] });
+      pcVehicle = new RTCPeerConnection({ iceServers: [] });
+
+      pcCockpit.onicecandidate = (e) => {
+        if (e.candidate) {
+          pcVehicle.addIceCandidate(e.candidate).catch((err) => log(`vehicle addIceCandidate failed: ${err}`, 'err'));
+        }
+      };
+      pcVehicle.onicecandidate = (e) => {
+        if (e.candidate) {
+          pcCockpit.addIceCandidate(e.candidate).catch((err) => log(`cockpit addIceCandidate failed: ${err}`, 'err'));
+        }
+      };
+
+      const remoteTrackPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('remote ontrack timeout')), 15000);
+        pcCockpit.ontrack = async (event) => {
+          remoteVideo.srcObject = event.streams[0];
+          clearTimeout(timeout);
+          log(`Remote video track received: ${event.track.kind}`);
+          await wait(1000);
+          resolve();
+        };
+      });
+
+      const stream = startMockVideo();
+      for (const track of stream.getVideoTracks()) {
+        pcVehicle.addTrack(track, stream);
+      }
+      pcCockpit.addTransceiver('video', { direction: 'recvonly' });
+
+      const preOfferContext = onBeforeOffer ? onBeforeOffer() : null;
+
+      const offer = await pcCockpit.createOffer();
+      await pcCockpit.setLocalDescription(offer);
+      await pcVehicle.setRemoteDescription(offer);
+      const answer = await pcVehicle.createAnswer();
+      await pcVehicle.setLocalDescription(answer);
+      await pcCockpit.setRemoteDescription(answer);
+
+      await remoteTrackPromise;
+
+      const stats = await pcCockpit.getStats();
+      let hasVideoRtp = false;
+      stats.forEach((report) => {
+        if (report.type === 'inbound-rtp' && report.kind === 'video' && ((report.bytesReceived || 0) > 0 || (report.packetsReceived || 0) > 0)) {
+          hasVideoRtp = true;
+        }
+      });
+      if (!hasVideoRtp) throw new Error('video RTP not observed');
+      log('Video channel validated', 'ok');
+
+      return preOfferContext;
+    }
+
+    function setupChannels() {
+      const pendingAcks = new Map();
+      const latestTelemetry = { mode: null, speed_mps: null, gear: null, emergency: false };
+
+      function sendCommand(cmd, payload = {}) {
+        return new Promise((resolve, reject) => {
+          cmdSeq += 1;
+          const cmdId = `cmd-${cmdSeq}`;
+          const timeout = setTimeout(() => {
+            pendingAcks.delete(cmdId);
+            reject(new Error(`ack timeout for ${cmd} (${cmdId})`));
+          }, 5000);
+          pendingAcks.set(cmdId, {
+            cmd,
+            resolve: (ack) => {
+              clearTimeout(timeout);
+              resolve(ack);
+            },
+          });
+          commandSendTs.set(cmdId, performance.now());
+          controlTx.send(JSON.stringify({ cmd, cmdId, ts: Date.now(), ...payload }));
+          log(`command sent: ${cmd} (${cmdId})`);
+        });
+      }
+
+      function waitForTelemetry(predicate, timeoutMs, name) {
+        return new Promise((resolve, reject) => {
+          const start = performance.now();
+          const timer = setInterval(() => {
+            if (predicate(latestTelemetry)) {
+              clearInterval(timer);
+              resolve();
+              return;
+            }
+            if (performance.now() - start > timeoutMs) {
+              clearInterval(timer);
+              reject(new Error(`telemetry wait timeout: ${name}`));
+            }
+          }, 120);
+        });
+      }
+
+      const controlOpenPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('control channel open timeout')), 10000);
+
+        controlTx = pcCockpit.createDataChannel('control');
+        controlTx.onopen = () => {
+          clearTimeout(timeout);
+          log('cockpit control channel open');
+          resolve();
+        };
+        controlTx.onmessage = (e) => {
+          let ack;
+          try { ack = JSON.parse(e.data); } catch { return; }
+          if (ack.type !== 'control_ack' || !ack.cmdId) return;
+          const startTs = commandSendTs.get(ack.cmdId);
+          if (startTs) {
+            commandLatencyMs.push(performance.now() - startTs);
+            commandSendTs.delete(ack.cmdId);
+          }
+          const waiter = pendingAcks.get(ack.cmdId);
+          if (waiter) {
+            pendingAcks.delete(ack.cmdId);
+            waiter.resolve(ack);
+          }
+          renderStats();
+        };
+      });
+
+      const telemetryReadyPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('telemetry channel timeout')), 10000);
+        telemetryRx = pcCockpit.createDataChannel('telemetry');
+        telemetryRx.onopen = () => {
+          clearTimeout(timeout);
+          log('cockpit telemetry channel open');
+          resolve();
+        };
+        telemetryRx.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+          if (msg.type !== 'telemetry') return;
+          latestTelemetry.mode = msg.data.mode;
+          latestTelemetry.speed_mps = msg.data.speed_mps;
+          latestTelemetry.gear = msg.data.gear;
+          latestTelemetry.emergency = !!msg.data.emergency;
+          if (modeTimeline[modeTimeline.length - 1] !== latestTelemetry.mode) {
+            modeTimeline.push(latestTelemetry.mode);
+            log(`mode update: ${latestTelemetry.mode}`);
+            renderStats();
+          }
+        };
+      });
+
+      pcVehicle.ondatachannel = (event) => {
+        if (event.channel.label === 'control') {
+          controlRx = event.channel;
+          const vehicleState = {
+            mode: 'AUTO',
+            speed_mps: 0,
+            gear: 0,
+            emergency: false,
+          };
+
+          const emitTelemetry = () => {
+            if (!telemetryTx || telemetryTx.readyState !== 'open') return;
+            telemetryTx.send(JSON.stringify({
+              type: 'telemetry',
+              data: {
+                mode: vehicleState.mode,
+                speed_mps: vehicleState.speed_mps,
+                gear: vehicleState.gear,
+                emergency: vehicleState.emergency,
+              },
+              ts: Date.now(),
+            }));
+          };
+
+          controlRx.onmessage = (e) => {
+            let cmd;
+            try { cmd = JSON.parse(e.data); } catch { return; }
+            const cmdId = cmd.cmdId;
+            if (!cmdId || !cmd.cmd) return;
+
+            if (cmd.cmd === 'TAKEOVER_REQUEST' && vehicleState.mode === 'AUTO') {
+              vehicleState.mode = 'REMOTE_CONTROL';
+              vehicleState.gear = 1;
+            } else if (cmd.cmd === 'FORWARD' && vehicleState.mode === 'REMOTE_CONTROL' && !vehicleState.emergency) {
+              vehicleState.speed_mps = 6.5;
+            } else if (cmd.cmd === 'STOP' && vehicleState.mode === 'REMOTE_CONTROL') {
+              vehicleState.speed_mps = 0;
+            } else if (cmd.cmd === 'EMERGENCY_STOP') {
+              vehicleState.mode = 'SAFE_STOP';
+              vehicleState.speed_mps = 0;
+              vehicleState.gear = 0;
+              vehicleState.emergency = true;
+            } else if (cmd.cmd === 'RECOVER_AUTO' && vehicleState.mode === 'SAFE_STOP') {
+              vehicleState.mode = 'AUTO';
+              vehicleState.speed_mps = 0;
+              vehicleState.gear = 0;
+              vehicleState.emergency = false;
+            }
+
+            controlRx.send(JSON.stringify({ type: 'control_ack', cmdId, ack: cmd.cmd, ts: Date.now() }));
+            emitTelemetry();
+          };
+          return;
+        }
+
+        if (event.channel.label === 'telemetry') {
+          telemetryTx = event.channel;
+          telemetryTx.onopen = () => {
+            let tick = 0;
+            const vehicleState = {
+              mode: 'AUTO',
+              speed_mps: 0,
+              gear: 0,
+              emergency: false,
+            };
+            telemetryTimer = setInterval(() => {
+              tick += 1;
+              telemetryTx.send(JSON.stringify({ type: 'telemetry', data: vehicleState, ts: Date.now() }));
+              if (tick >= 2 && telemetryTimer) {
+                clearInterval(telemetryTimer);
+                telemetryTimer = null;
+              }
+            }, 250);
+          };
+        }
+      };
+
+      return { controlOpenPromise, telemetryReadyPromise, sendCommand, waitForTelemetry };
+    }
+
+    function assertModeTransitionOrder() {
+      const required = ['AUTO', 'REMOTE_CONTROL', 'SAFE_STOP', 'AUTO'];
+      let at = 0;
+      for (const mode of modeTimeline) {
+        if (mode === required[at]) {
+          at += 1;
+          if (at === required.length) return;
+        }
+      }
+      throw new Error(`mode transition mismatch: got ${modeTimeline.join(' -> ')}`);
+    }
+
+    async function runTakeoverValidation() {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Running...', '');
+      renderStats();
+
+      try {
+        const channelContext = await setupPeer(() => setupChannels());
+        const { controlOpenPromise, telemetryReadyPromise, sendCommand, waitForTelemetry } = channelContext;
+
+        await Promise.all([controlOpenPromise, telemetryReadyPromise]);
+
+        await waitForTelemetry((t) => t.mode === 'AUTO', 6000, 'initial AUTO mode');
+        await sendCommand('TAKEOVER_REQUEST');
+        await waitForTelemetry((t) => t.mode === 'REMOTE_CONTROL', 5000, 'REMOTE_CONTROL mode');
+
+        await sendCommand('FORWARD', { value: 0.5 });
+        await waitForTelemetry((t) => t.mode === 'REMOTE_CONTROL' && (t.speed_mps || 0) > 1, 5000, 'speed increase after FORWARD');
+
+        await sendCommand('EMERGENCY_STOP');
+        await waitForTelemetry((t) => t.mode === 'SAFE_STOP' && (t.speed_mps || 0) === 0 && t.emergency === true, 5000, 'safe stop after emergency');
+
+        await sendCommand('RECOVER_AUTO');
+        await waitForTelemetry((t) => t.mode === 'AUTO' && t.emergency === false, 5000, 'AUTO recovery');
+
+        assertModeTransitionOrder();
+        const latencyP95 = p95(commandLatencyMs);
+        if (!Number.isFinite(latencyP95) || latencyP95 > 1500) {
+          throw new Error(`ack latency p95 too high: ${Number.isFinite(latencyP95) ? latencyP95.toFixed(1) : 'N/A'}ms`);
+        }
+
+        setStatus('PASS: takeover + safety state validation passed', 'ok');
+      } catch (err) {
+        setStatus(`FAIL: ${err.message || err}`, 'err');
+        log(`Takeover validation failed: ${err.stack || err}`, 'err');
+      }
+      renderStats();
+    }
+
+    document.getElementById('btnRun').addEventListener('click', runTakeoverValidation);
+    document.getElementById('btnReset').addEventListener('click', () => {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Idle', '');
+    });
+  </script>
+</body>
+</html>

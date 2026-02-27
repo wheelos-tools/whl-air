@@ -1,0 +1,22 @@
+{
+	"name": "whl-air-cockpit-display",
+	"version": "1.0.0",
+	"private": true,
+	"description": "Automated browser tests for cockpit display WebRTC pages",
+	"scripts": {
+		"test:e2e:local": "node tests/run_local_integration_e2e.mjs",
+		"test:e2e:local:debug": "HEADLESS=false node tests/run_local_integration_e2e.mjs",
+		"test:e2e:remote-driving": "E2E_PAGE=/rtc_remote_driving_validation_test.html node tests/run_local_integration_e2e.mjs",
+		"test:e2e:remote-driving:degraded": "E2E_PAGE=/rtc_remote_driving_validation_test.html E2E_QUERY=network=degraded node tests/run_local_integration_e2e.mjs",
+		"test:e2e:remote-driving:harsh": "E2E_PAGE=/rtc_remote_driving_validation_test.html E2E_QUERY=network=harsh node tests/run_local_integration_e2e.mjs",
+		"test:e2e:remote-driving:loop": "for i in 1 2 3 4 5; do echo \"[loop] run $i\"; E2E_PAGE=/rtc_remote_driving_validation_test.html node tests/run_local_integration_e2e.mjs || exit 1; done",
+		"test:e2e:remote-driving:degraded:loop": "for i in 1 2 3 4 5; do echo \"[degraded-loop] run $i\"; E2E_PAGE=/rtc_remote_driving_validation_test.html E2E_QUERY=network=degraded node tests/run_local_integration_e2e.mjs || exit 1; done",
+		"test:e2e:takeover-safety": "E2E_PAGE=/rtc_takeover_safety_validation_test.html node tests/run_local_integration_e2e.mjs",
+		"test:e2e:takeover-safety:loop": "for i in 1 2 3 4 5; do echo \"[takeover-loop] run $i\"; E2E_PAGE=/rtc_takeover_safety_validation_test.html node tests/run_local_integration_e2e.mjs || exit 1; done",
+		"install:browsers": "npx playwright install chromium",
+		"install:browsers:cn": "PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright npx playwright install chromium"
+	},
+	"devDependencies": {
+		"playwright": "1.55.1"
+	}
+}

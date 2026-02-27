@@ -1,544 +1,518 @@
-#include "vehicle_client_app.h"
-
-// Include concrete implementations (moved to main or factory in ideal scenario)
-#include "config/json_config_loader.h"  // Example concrete loader
-#include "control/apollo_controller.h"  // Example concrete controller
-#include "network_manager/connection_monitor_impl.h"  // Example concrete monitor
-#include "sensors/canbus_chassis_source.h"  // Example concrete chassis
-#include "sensors/v4l2_camera_source.h"     // Example concrete camera
-#include "webrtc/webrtc_manager_impl.h"     // Example concrete webrtc manager
-
-// Placeholder for Protobuf messages (needs actual definition)
-// #include "proto/control/control_command.pb.h"
-// #include "proto/control/emergency_command.pb.h"
-// #include "proto/chassis/chassis_state.pb.h"
-
+#include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <functional>
+#include <csignal>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
-// Dummy Protobuf messages for compilation
-namespace autodev {
-namespace remote {
-namespace control {
+#include "vehicle_client/domain/runtime_state.h"
 
-struct ControlCommand {
-  void set_acceleration(double) {}
+namespace {
+
+struct RuntimeConfig {
+  std::string client_id = "vehicle_client_default";
+  int camera_fps = 15;
+  int telemetry_interval_ms = 200;
+  int heartbeat_interval_ms = 1000;
+  std::string control_channel_label = "control";
+  std::string telemetry_channel_label = "telemetry";
 };
-struct EmergencyCommand {
-  void set_type(int) {}
-  enum Type { EMERGENCY_STOP };
-};
-}  // namespace control
-namespace chassis {
-struct Chassis {
-  size_t ByteSizeLong() const { return 0; }
-  bool SerializeToArray(void*, size_t) const { return true; }
-  double speed_mps() const { return 0.0; }
-};
-}  // namespace chassis
-}  // namespace remote
-}  // namespace autodev
 
-namespace autodev {
-namespace remote {
-namespace vehicle {
+using RuntimeState = vehicle_domain::RuntimeState;
+using RuntimeStats = vehicle_domain::RuntimeStats;
 
-// --- Constructor and Destructor ---
+std::atomic<bool> g_stop_requested{false};
 
-VehicleClientApp::VehicleClientApp() : state_(AppState::Uninitialized) {
-  std::cout << "VehicleClientApp created." << std::endl;
+void signal_handler(int signal_number) {
+  std::cerr << "vehicle_client_app received signal " << signal_number
+            << ", stopping..." << std::endl;
+  g_stop_requested = true;
 }
 
-VehicleClientApp::~VehicleClientApp() {
-  std::cout << "VehicleClientApp destroying..." << std::endl;
-  stop();  // Ensure stop is called
-  std::cout << "VehicleClientApp destroyed." << std::endl;
+std::string trim(const std::string& value) {
+  const char* ws = " \t\r\n";
+  const auto begin = value.find_first_not_of(ws);
+  if (begin == std::string::npos) {
+    return "";
+  }
+  const auto end = value.find_last_not_of(ws);
+  return value.substr(begin, end - begin + 1);
 }
 
-// --- Initialization ---
+bool to_int(const std::string& value, int* out) {
+  try {
+    *out = std::stoi(value);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
 
-bool VehicleClientApp::init(
-    const VehicleConfig& config, std::unique_ptr<WebrtcManager> webrtcManager,
-    std::unique_ptr<IController> controller,
-    std::unique_ptr<ICameraSource> cameraSource,
-    std::unique_ptr<IChassisSource> chassisSource) {
-  if (state_ != AppState::Uninitialized) {
-    std::cerr
-        << "VehicleClientApp: Already initialized or in a different state."
-        << std::endl;
+bool load_config(const std::string& config_path, RuntimeConfig* config) {
+  std::ifstream input(config_path);
+  if (!input.is_open()) {
+    std::cerr << "Failed to open config: " << config_path << std::endl;
     return false;
   }
 
-  state_ = AppState::Initializing;
-  std::cout << "VehicleClientApp: Initializing..." << std::endl;
-
-  // 1. Store Configuration
-  config_ = config;
-  std::cout << "VehicleClientApp: Config stored." << std::endl;
-
-  // 2. Store Injected Components
-  // Transfer ownership of injected components
-  webrtcManager_ = std::move(webrtcManager);
-  controller_ = std::move(controller);
-  cameraSource_ = std::move(cameraSource);
-  chassisSource_ = std::move(chassisSource);
-
-  // 3. Setup Components (Configure and connect signals/slots/callbacks)
-  // Now just call setup methods on the injected components
-
-  if (!setupWebrtcManager()) {
-    std::cerr << "VehicleClientApp: Failed to setup WebRTC Manager."
-              << std::endl;
-    state_ = AppState::Uninitialized;  // Reset state on failure
-    return false;
+  std::unordered_map<std::string, std::string> kv;
+  std::string line;
+  while (std::getline(input, line)) {
+    line = trim(line);
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    const auto pos = line.find('=');
+    if (pos == std::string::npos) {
+      std::cerr << "Invalid config line (expected key=value): " << line
+                << std::endl;
+      return false;
+    }
+    std::string key = trim(line.substr(0, pos));
+    std::string value = trim(line.substr(pos + 1));
+    if (!key.empty()) {
+      kv[key] = value;
+    }
   }
 
-  if (!setupController()) {
-    std::cerr << "VehicleClientApp: Failed to setup Controller." << std::endl;
-    state_ = AppState::Uninitialized;  // Reset state on failure
-    return false;
+  if (kv.count("client_id")) {
+    config->client_id = kv["client_id"];
+  }
+  if (kv.count("control_channel_label")) {
+    config->control_channel_label = kv["control_channel_label"];
+  }
+  if (kv.count("telemetry_channel_label")) {
+    config->telemetry_channel_label = kv["telemetry_channel_label"];
   }
 
-  if (!setupSensors()) {
-    std::cerr << "VehicleClientApp: Failed to setup Sensors." << std::endl;
-    state_ = AppState::Uninitialized;  // Reset state on failure
-    return false;
+  int parsed = 0;
+  if (kv.count("camera_fps") && to_int(kv["camera_fps"], &parsed)) {
+    config->camera_fps = std::max(1, parsed);
   }
-
-  state_ = AppState::Initialized;
-  std::cout << "VehicleClientApp: Initialization successful." << std::endl;
+  if (kv.count("telemetry_interval_ms") &&
+      to_int(kv["telemetry_interval_ms"], &parsed)) {
+    config->telemetry_interval_ms = std::max(20, parsed);
+  }
+  if (kv.count("heartbeat_interval_ms") &&
+      to_int(kv["heartbeat_interval_ms"], &parsed)) {
+    config->heartbeat_interval_ms = std::max(0, parsed);
+  }
   return true;
 }
 
-// --- Running the Application ---
-
-int VehicleClientApp::run() {
-  if (state_ != AppState::Initialized) {
-    std::cerr << "VehicleClientApp: Cannot run, not in Initialized state."
-              << std::endl;
-    return 1;  // Indicate error
-  }
-
-  state_ = AppState::Running;
-  std::cout << "VehicleClientApp: Running main loop..." << std::endl;
-
-  // TODO: Integrate with the actual event loop managed by libraries (e.g.,
-  // libwebrtc's signaling thread, boost::asio::io_context). The run() method
-  // should typically delegate to the event loop's run method or join its
-  // thread. Example with Asio: if (ioContext_) {
-  //     ioThread_ = std::make_unique<std::thread>([this]{ ioContext_->run();
-  //     });
-  // }
-
-  // For skeleton, simulate running and wait for stop signal
-  // In a real application, Ctrl+C or other signals should trigger stop().
-  // The event loop would prevent the main thread from exiting here.
-  while (state_ == AppState::Running) {
-    // In a real app, this loop doesn't actively do work, the event loop
-    // callbacks do. We need a mechanism to exit this loop when stop() is
-    // called. This placeholder will just print and wait.
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    // std::cout << "App running..." << std::endl; // Avoid spamming output
-  }
-
-  std::cout << "VehicleClientApp: Main loop finished." << std::endl;
-  state_ = AppState::Stopped;
-  return 0;  // Indicate success
+void publish_status_update(RuntimeState* runtime, const std::string& category,
+                           const std::string& value) {
+  std::lock_guard<std::mutex> lock(runtime->mutex);
+  runtime->stats.status_updates += 1;
+  std::cout << "[vehicle/status] category=" << category << " value=" << value
+            << " mode=" << runtime->mode << " peer_connected="
+            << (runtime->peer_connected ? "true" : "false") << std::endl;
 }
 
-// --- Stopping the Application ---
-
-void VehicleClientApp::stop() {
-  if (state_ == AppState::Stopping || state_ == AppState::Stopped ||
-      state_ == AppState::Uninitialized) {
-    std::cout << "VehicleClientApp: Already stopping, stopped, or "
-                 "uninitialized. Skipping stop."
-              << std::endl;
-    return;
-  }
-
-  state_ = AppState::Stopping;
-  std::cout << "VehicleClientApp: Stopping..." << std::endl;
-
-  // TODO: Signal event loop to stop if it's running on a separate thread.
-  // Example with Asio:
-  // if (ioContext_) {
-  //     ioContext_->stop();
-  // }
-
-  // Stop sensor data flow
-  if (chassisSource_) {
-    chassisSource_->stopUpdates();
-    std::cout << "VehicleClientApp: Chassis Source stopped." << std::endl;
-  }
-  if (cameraSource_) {
-    cameraSource_->stopCapture();
-    std::cout << "VehicleClientApp: Camera Source stopped." << std::endl;
-  }
-
-  // Stop WebRTC gracefully
-  if (webrtcManager_) {
-    webrtcManager_->stop();
-    std::cout << "VehicleClientApp: WebRTC Manager stopped." << std::endl;
-  }
-
-  // The controller doesn't typically have a 'stop' method in this context,
-  // it just stops processing commands when the app stops.
-
-  // TODO: Join event loop thread if it was started in run().
-  // Example with Asio:
-  // if (ioThread_ && ioThread_->joinable()) {
-  //     ioThread_->join();
-  //     std::cout << "VehicleClientApp: I/O thread joined." << std::endl;
-  // }
-
-  std::cout << "VehicleClientApp: All components stopped." << std::endl;
-  state_ = AppState::Stopped;
+void handle_peer_connected(RuntimeState* runtime, const RuntimeConfig& config) {
+  vehicle_domain::OnPeerConnected(runtime);
+  std::cout << "[vehicle/peer] connected peer_id=" << config.client_id
+            << " remote=cockpit" << std::endl;
+  publish_status_update(runtime, "peer", "connected");
 }
 
-// --- Component Setup Methods (now simpler) ---
+void handle_peer_disconnected(RuntimeState* runtime,
+                              const std::string& reason) {
+  vehicle_domain::OnPeerDisconnected(runtime);
+  std::cout << "[vehicle/peer] disconnected reason=" << reason << std::endl;
+  publish_status_update(runtime, "peer", "disconnected");
+}
 
-bool VehicleClientApp::setupWebrtcManager() {
-  std::cout << "VehicleClientApp: Setting up WebrtcManager callbacks..."
-            << std::endl;
-  if (!webrtcManager_) {
-    std::cerr << "VehicleClientApp: WebrtcManager not injected!" << std::endl;
+void handle_network_down(RuntimeState* runtime, const std::string& reason) {
+  vehicle_domain::OnNetworkDown(runtime);
+  std::cout << "[vehicle/network] down reason=" << reason << std::endl;
+  publish_status_update(runtime, "network", "down");
+}
+
+void handle_network_up(RuntimeState* runtime) {
+  vehicle_domain::OnNetworkUp(runtime);
+  std::cout << "[vehicle/network] up" << std::endl;
+  publish_status_update(runtime, "network", "up");
+}
+
+void handle_heartbeat_lost(RuntimeState* runtime) {
+  vehicle_domain::OnHeartbeatLost(runtime);
+  std::cout << "[vehicle/network] heartbeat_lost" << std::endl;
+  publish_status_update(runtime, "network", "heartbeat_lost");
+}
+
+void handle_telemetry_message_received(RuntimeState* runtime,
+                                       const std::string& peer_id,
+                                       const std::string& payload) {
+  vehicle_domain::OnTelemetryMessageReceived(runtime);
+  std::cout << "[vehicle/telemetry_rx] peer=" << peer_id
+            << " payload_size=" << payload.size() << std::endl;
+  publish_status_update(runtime, "telemetry_rx", "received");
+}
+
+void handle_webrtc_error(RuntimeState* runtime, const std::string& error_msg) {
+  vehicle_domain::OnWebrtcError(runtime);
+  std::cout << "[vehicle/webrtc] error=" << error_msg << std::endl;
+  publish_status_update(runtime, "webrtc", "error");
+}
+
+bool process_command(RuntimeState* runtime, const std::string& source,
+                     const std::string& command_name,
+                     const std::string& command_id) {
+  if (!vehicle_domain::ApplyCommand(runtime, source, command_name)) {
     return false;
   }
 
-  // Use lambdas for cleaner binding
-  webrtcManager_->onPeerConnected(
-      [this](const std::string& peer_id) { handlePeerConnected(peer_id); });
-  webrtcManager_->onPeerDisconnected(
-      [this](const std::string& peer_id, const std::string& reason) {
-        handlePeerDisconnected(peer_id, reason);
-      });
-  webrtcManager_->onControlMessageReceived(
-      [this](const std::string& peer_id, const std::vector<char>& message) {
-        handleControlMessageReceived(peer_id, message);
-      });
-  webrtcManager_->onTelemetryMessageReceived(
-      [this](const std::string& peer_id, const std::vector<char>& message) {
-        handleTelemetryMessageReceived(peer_id, message);
-      });
-  webrtcManager_->onError(
-      [this](const std::string& error_msg) { handleWebrtcError(error_msg); });
-
-  // TODO: Initialize the webrtcManager using the config
-  // webrtcManager_->init(config_.webrtc); // Assuming WebrtcManager has an init
-  // with relevant config
-  std::cout << "VehicleClientApp: WebrtcManager setup complete." << std::endl;
-  return true;
-}
-
-bool VehicleClientApp::setupController() {
-  std::cout << "VehicleClientApp: Setting up Controller..." << std::endl;
-  if (!controller_) {
-    std::cerr << "VehicleClientApp: Controller not injected!" << std::endl;
-    return false;
-  }
-  // TODO: Initialize the controller if it requires config
-  // controller_->init(config_.control); // Assuming Controller has an init
-  // method
-  std::cout << "VehicleClientApp: Controller setup complete." << std::endl;
-  return true;
-}
-
-bool VehicleClientApp::setupSensors() {
-  std::cout << "VehicleClientApp: Setting up Sensors..." << std::endl;
-  if (!cameraSource_ || !chassisSource_) {
-    std::cerr << "VehicleClientApp: Sensor sources not injected!" << std::endl;
-    return false;
-  }
-
-  // Init sensors with config
-  if (!cameraSource_->init(
-          config_.sensors.camera_device, config_.sensors.camera_width,
-          config_.sensors.camera_height, config_.sensors.camera_fps)) {
-    std::cerr << "VehicleClientApp: Failed to initialize camera source."
-              << std::endl;
-    return false;
-  }
-
-  // TODO: Pass chassis config to init
-  if (!chassisSource_->init(/* config_.sensors.can_interface */)) {
-    std::cerr << "VehicleClientApp: Failed to initialize chassis source."
-              << std::endl;
-    return false;
-  }
-
-  // Connect sensor outputs to handlers (Handlers will route data via WebRTC)
-  // Note: This assumes sensor sources provide a mechanism to register callbacks
-  // on frame capture or state update.
-  // Example using lambda capturing 'this':
-  cameraSource_->setOnFrameCapturedHandler([this](/* frame data */) {
-    handleCameraFrameCaptured(/* frame data */);
-  });
-
-  chassisSource_->setOnStateUpdatedHandler(
-      [this](const autodev::remote::chassis::Chassis& state) {
-        handleChassisStateUpdated(state);
-      });
-
-  std::cout << "VehicleClientApp: Sensors setup complete." << std::endl;
-  return true;
-}
-
-// --- Handlers for WebrtcManager events ---
-
-void VehicleClientApp::handlePeerConnected(const std::string& peer_id) {
-  std::cout << "App: Peer " << peer_id << " connected via WebRTC." << std::endl;
-  // TODO: Start sending data/video for this peer
-  // Sensors should start capturing/updating now that a peer is available.
-  // Actual sending will happen in sensor data handlers or by piping sensor
-  // output directly into WebRTC tracks/data channels.
-
-  if (cameraSource_) {
-    // startCapture needs a handler for frames - already set in setupSensors
-    cameraSource_->startCapture(/* pass parameters like peer_id if needed */);
-  }
-  if (chassisSource_) {
-    // startUpdates needs a handler for state - already set in setupSensors
-    chassisSource_->startUpdates(/* pass parameters like peer_id if needed */);
-  }
-}
-
-void VehicleClientApp::handlePeerDisconnected(const std::string& peer_id,
-                                              const std::string& reason) {
-  std::cout << "App: Peer " << peer_id << " disconnected. Reason: " << reason
-            << std::endl;
-  // TODO: Stop sending data/video specific to this peer if not handled
-  // automatically. Clean up any peer-specific resources.
-
-  // Policy Decision: Should sensors stop if ALL peers disconnect?
-  // Current skeleton keeps them running. A production app might stop sensors
-  // to save resources if no one is viewing/receiving data.
-}
-
-void VehicleClientApp::handleControlMessageReceived(
-    const std::string& peer_id, const std::vector<char>& message) {
-  // std::cout << "App: Received control message from " << peer_id << ", size="
-  // << message.size() << std::endl;
-  if (!controller_) {
-    std::cerr
-        << "App: Received control message but controller is not available!"
-        << std::endl;
-    return;
-  }
-
-  // TODO: Deserialize protobuf message and pass to controller
-  // Needs to distinguish ControlCommand vs EmergencyCommand based on content or
-  // a wrapper. Example (simplified): autodev::remote::control::ControlCommand
-  // command; if (command.ParseFromArray(message.data(), message.size())) {
-  //      controller_->processControlCommand(command);
-  //      return; // Successfully processed as ControlCommand
-  // }
-
-  // // Try deserializing as EmergencyCommand
-  // autodev::remote::control::EmergencyCommand emergency_command;
-  // if (emergency_command.ParseFromArray(message.data(), message.size())) {
-  //      controller_->processEmergencyCommand(emergency_command);
-  //      return; // Successfully processed as EmergencyCommand
-  // }
-
-  // std::cerr << "App: Failed to parse control/emergency message from " <<
-  // peer_id << std::endl;
-  // TODO: Handle parsing error - maybe send NACK or log error details
-
-  // Simulate processing by calling dummy controller methods
-  // autodev::remote::control::ControlCommand dummy_cmd;
-  // dummy_cmd.set_acceleration(1.0); // Set dummy data based on message content
-  // if possible controller_->processControlCommand(dummy_cmd);
-
-  // autodev::remote::control::EmergencyCommand dummy_ecmd;
-  // dummy_ecmd.set_type(autodev::remote::control::EMERGENCY_STOP); // Set dummy
-  // type based on message content
-  // controller_->processEmergencyCommand(dummy_ecmd);
-
-  // Placeholder print for received message
-  // std::cout << "App: Processing control message (placeholder)." << std::endl;
-}
-
-void VehicleClientApp::handleTelemetryMessageReceived(
-    const std::string& peer_id, const std::vector<char>& message) {
-  // std::cout << "App: Received telemetry message from " << peer_id << ",
-  // size=" << message.size() << std::endl; This might be loopback or commands
-  // on the telemetry channel
-  // TODO: Handle incoming telemetry data if applicable (e.g., for logging,
-  // monitoring, diagnostics) Telemetry channel is usually for sending vehicle
-  // data OUT, receiving IN is less common for control. If receiving,
-  // deserialize message and process. std::cout << "App: Processing telemetry
-  // message (placeholder)." << std::endl;
-}
-
-void VehicleClientApp::handleWebrtcError(const std::string& error_msg) {
-  std::cerr << "App: WebRTC Error: " << error_msg << std::endl;
-  // TODO: Handle errors (logging, retry logic, potentially trigger emergency
-  // stop) Depending on the severity, this might necessitate stopping the
-  // application or taking safety actions. Example: Triggering safety stop on
-  // critical WebRTC failure if (controller_) {
-  //     autodev::remote::control::EmergencyCommand emergency_command;
-  //     emergency_command.set_type(autodev::remote::control::EMERGENCY_STOP);
-  //     // emergency_command.set_reason("WebRTC Critical Error");
-  //     controller_->processEmergencyCommand(emergency_command);
-  // }
-}
-
-// --- Handlers for Sensor Events ---
-
-void VehicleClientApp::handleCameraFrameCaptured(
-    /* frame data */) {  // Needs actual frame data type, e.g., const FrameData&
-  // std::cout << "App: Camera frame captured (placeholder)." << std::endl;
-  // TODO: Send the frame data via WebRTC video track(s).
-  // This requires access to the WebRTC PeerConnection(s) and video track
-  // sender(s). The camera source might push directly into a WebRTC track
-  // source, or this handler receives the frame and manually pushes it.
-
-  // Example (Conceptual):
-  // if (webrtcManager_) {
-  //     webrtcManager_->sendVideoFrameToAllPeers(frame_data); // Needs
-  //     implementation in WebrtcManager
-  // }
-}
-
-void VehicleClientApp::handleChassisStateUpdated(
-    const autodev::remote::chassis::Chassis& state) {
-  // std::cout << "App: Chassis state updated (placeholder): Speed=" <<
-  // state.speed_mps() << std::endl;
-  // TODO: Serialize the Protobuf message
-  std::vector<char> serialized_data(state.ByteSizeLong());
-  // if (!state.SerializeToArray(serialized_data.data(),
-  // serialized_data.size())) {
-  //     std::cerr << "App: Failed to serialize Chassis state." << std::endl;
-  //     // TODO: Handle serialization error
-  //     return;
-  // }
-
-  // Send serialized data via the telemetry DataChannel to all connected peers
-  if (webrtcManager_) {
-    // Use a defined constant for the data channel label
-    const std::string telemetry_channel_label = "telemetry";
-    // webrtcManager_->sendDataChannelMessageToAllPeers(telemetry_channel_label,
-    // serialized_data); // Needs implementation
-  }
-  // Placeholder print for state
-  // std::cout << "App: Chassis state updated (placeholder)." << std::endl;
-}
-
-// --- Handlers for ConnectionMonitor Events ---
-
-void VehicleClientApp::handleNetworkUp(const std::string& peer_id) {
-  std::cout << "App: Network is UP with peer " << peer_id << std::endl;
-  // TODO: Application logic upon network up (e.g., enable driving capability,
-  // switch control modes) Inform controller? Enable a flag?
-}
-
-void VehicleClientApp::handleNetworkDown(const std::string& peer_id,
-                                         const std::string& reason) {
-  std::cerr << "App: Network is DOWN with peer " << peer_id
-            << ". Reason: " << reason << std::endl;
-  // TODO: Application logic upon network down (e.g., disable driving
-  // capability, activate safety stop) This is critical! Trigger emergency stop.
-  if (controller_) {
-    autodev::remote::control::EmergencyCommand emergency_command;
-    emergency_command.set_type(
-        autodev::remote::control::EMERGENCY_STOP);  // Assuming EMERGENCY_STOP
-                                                    // is a valid type
-    // emergency_command.set_reason("Network down: " + reason); // Add reason
-    controller_->processEmergencyCommand(emergency_command);
-  }
-}
-
-void VehicleClientApp::handleHeartbeatLost(const std::string& peer_id) {
-  std::cerr << "App: Heartbeat lost from peer " << peer_id << std::endl;
-  // TODO: Trigger a safety action. Heartbeat loss is a strong indicator of
-  // connectivity issue. Typically leads to a safety stop.
-  if (controller_) {
-    autodev::remote::control::EmergencyCommand emergency_command;
-    emergency_command.set_type(
-        autodev::remote::control::EMERGENCY_STOP);  // Assuming EMERGENCY_STOP
-                                                    // is a valid type
-    // emergency_command.set_reason("Heartbeat lost from peer " + peer_id); //
-    // Add reason
-    controller_->processEmergencyCommand(emergency_command);
-  }
-}
-
-}  // namespace vehicle
-}  // namespace remote
-}  // namespace autodev
-
-// --- Main Application Entry Point ---
-
-int main(int argc, char* argv[]) {
-  if (argc < 2) {
-    std::cerr << "Usage: " << argv[0] << " <config_file_path>" << std::endl;
-    return 1;
-  }
-
-  std::string config_path = argv[1];
-
-  // 1. Load Configuration (Done outside the App for dependency injection)
-  autodev::remote::config::JsonConfigLoader config_loader;
-  auto loaded_config = config_loader.loadConfig(config_path);
-  if (!loaded_config) {
-    std::cerr << "Failed to load configuration from " << config_path
-              << std::endl;
-    return 1;
-  }
-  autodev::remote::vehicle::VehicleConfig app_config = *loaded_config;
-  std::cout << "Configuration loaded successfully." << std::endl;
-
-  // 2. Create Concrete Component Instances (Done outside the App)
-  // These would ideally be based on the configuration (e.g., config says use
-  // V4L2, Apollo, etc.) Using concrete classes directly for this example.
-  auto webrtc_manager =
-      std::make_unique<autodev::remote::webrtc::WebrtcManagerImpl>();
-  auto controller =
-      std::make_unique<autodev::remote::control::ApolloController>();
-  auto camera_source =
-      std::make_unique<autodev::remote::sensors::V4L2CameraSource>();
-  auto chassis_source =
-      std::make_unique<autodev::remote::sensors::CanBusChassisSource>();
-
-  // Create Connection Monitor only if heartbeat is configured
-  std::unique_ptr<autodev::remote::network_manager::IConnectionMonitor>
-      connection_monitor = nullptr;
-  if (app_config.heartbeat_interval_ms > 0) {
-    // DANGER: Passing webrtc_manager.get() requires careful lifetime
-    // management. The monitor *must* be stopped before the webrtc_manager is
-    // destroyed. This is handled in VehicleClientApp::stop().
-    connection_monitor = std::make_unique<
-        autodev::remote::network_manager::ConnectionMonitorImpl>(
-        webrtc_manager.get(),
-        app_config.heartbeat_interval_ms);  // Assuming MonitorImpl takes raw
-                                            // pointer and interval
-    std::cout << "Connection Monitor created." << std::endl;
-  } else {
-    std::cout << "Heartbeat interval <= 0, Connection Monitor not created."
-              << std::endl;
-  }
-
-  // 3. Create and Initialize the Application with Dependencies
-  autodev::remote::vehicle::VehicleClientApp app;
-
-  if (!app.init(app_config, std::move(webrtc_manager), std::move(controller),
-                std::move(camera_source), std::move(chassis_source),
-                std::move(connection_monitor)))  // Pass optional monitor
+  std::string mode;
+  double speed_mps = 0.0;
   {
-    std::cerr << "Failed to initialize vehicle client application."
-              << std::endl;
-    return 1;
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    mode = runtime->mode;
+    speed_mps = runtime->speed_mps;
+  }
+  std::cout << "[vehicle/control] source=" << source
+            << " ack cmd=" << command_name << " cmd_id=" << command_id
+            << " mode=" << mode << " speed=" << speed_mps
+            << std::endl;
+  return true;
+}
+
+void camera_loop(RuntimeState* runtime, const RuntimeConfig& config) {
+  const auto interval = std::chrono::milliseconds(1000 / config.camera_fps);
+  while (!g_stop_requested) {
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->stats.camera_frames += 1;
+      if (runtime->peer_connected) {
+        runtime->stats.video_frames_sent += 1;
+      }
+    }
+    std::this_thread::sleep_for(interval);
+  }
+}
+
+void telemetry_loop(RuntimeState* runtime, const RuntimeConfig& config) {
+  const auto interval = std::chrono::milliseconds(config.telemetry_interval_ms);
+  while (!g_stop_requested) {
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->stats.telemetry_messages += 1;
+      if (runtime->peer_connected) {
+        runtime->stats.telemetry_sent += 1;
+      }
+      std::cout << "[vehicle/telemetry] mode=" << runtime->mode
+                << " speed_mps=" << runtime->speed_mps
+                << " gear=" << runtime->gear
+                << " emergency=" << (runtime->emergency ? "true" : "false")
+                << " sent=" << runtime->stats.telemetry_sent << std::endl;
+    }
+    std::this_thread::sleep_for(interval);
+  }
+}
+
+void heartbeat_loop(RuntimeState* runtime, const RuntimeConfig& config) {
+  const auto interval = std::chrono::milliseconds(config.heartbeat_interval_ms);
+  while (!g_stop_requested) {
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->stats.heartbeat_messages += 1;
+      std::cout << "[vehicle/heartbeat] client_id=" << config.client_id
+                << " status=alive" << std::endl;
+    }
+    std::this_thread::sleep_for(interval);
+  }
+}
+
+bool run_self_test(RuntimeState* runtime, const RuntimeConfig& config) {
+  handle_peer_connected(runtime, config);
+  handle_telemetry_message_received(runtime, config.client_id,
+                                    "diag:loopback_payload");
+
+  int command_index = 0;
+  auto apply_cmd = [&](const std::string& source, const std::string& cmd,
+                       int delay_ms) -> bool {
+    if (g_stop_requested) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    std::ostringstream cmd_id;
+    cmd_id << source << "-" << (++command_index);
+    return process_command(runtime, source, cmd, cmd_id.str());
+  };
+
+  if (!apply_cmd("control_channel", "TAKEOVER_REQUEST", 180)) {
+    std::cerr << "Self-test command failed: TAKEOVER_REQUEST" << std::endl;
+    return false;
+  }
+  if (!apply_cmd("control_channel", "FORWARD", 160)) {
+    std::cerr << "Self-test command failed: FORWARD" << std::endl;
+    return false;
+  }
+  if (!apply_cmd("control_channel", "STOP", 140)) {
+    std::cerr << "Self-test command failed: STOP" << std::endl;
+    return false;
+  }
+  if (!apply_cmd("safety_channel", "EMERGENCY_STOP", 120)) {
+    std::cerr << "Self-test command failed: EMERGENCY_STOP" << std::endl;
+    return false;
   }
 
-  std::cout << "Vehicle client initialized. Running..." << std::endl;
+  handle_network_down(runtime, "network_drop");
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  handle_network_up(runtime);
 
-  // 4. Run the Application (delegates to event loop)
-  int return_code = app.run();
+  if (!apply_cmd("control_channel", "RECOVER_AUTO", 140)) {
+    std::cerr << "Self-test command failed: RECOVER_AUTO" << std::endl;
+    return false;
+  }
 
-  std::cout << "Vehicle client stopped." << std::endl;
+  handle_heartbeat_lost(runtime);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  if (!apply_cmd("control_channel", "RECOVER_AUTO", 120)) {
+    std::cerr << "Self-test command failed: RECOVER_AUTO after heartbeat_lost"
+              << std::endl;
+    return false;
+  }
 
-  return return_code;
+  handle_webrtc_error(runtime, "simulated_media_path_failure");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  if (!apply_cmd("control_channel", "RECOVER_AUTO", 120)) {
+    std::cerr << "Self-test command failed: RECOVER_AUTO after webrtc_error"
+              << std::endl;
+    return false;
+  }
+
+  handle_peer_disconnected(runtime, "peer_reset");
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  handle_peer_connected(runtime, config);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  RuntimeStats stats;
+  std::string final_mode;
+  bool emergency = false;
+  bool peer_connected = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    stats = runtime->stats;
+    final_mode = runtime->mode;
+    emergency = runtime->emergency;
+    peer_connected = runtime->peer_connected;
+  }
+
+  const std::vector<std::string> expected_modes = {
+      "AUTO", "REMOTE_CONTROL", "SAFE_STOP", "AUTO", "SAFE_STOP", "AUTO"};
+  size_t cursor = 0;
+  for (const auto& mode : stats.mode_timeline) {
+    if (cursor < expected_modes.size() && mode == expected_modes[cursor]) {
+      ++cursor;
+    }
+  }
+
+  bool ok = true;
+  ok = ok && (stats.camera_frames > 0);
+  ok = ok && (stats.video_frames_sent > 0);
+  ok = ok && (stats.telemetry_messages >= 3);
+  ok = ok && (stats.telemetry_sent > 0);
+  ok = ok && (stats.telemetry_messages_received >= 1);
+  ok = ok &&
+       ((config.heartbeat_interval_ms > 0) ? (stats.heartbeat_messages > 0)
+                                           : (stats.heartbeat_messages == 0));
+  ok = ok && (stats.command_acks >= 7);
+  ok = ok && (stats.control_messages_received >= 5);
+  ok = ok && (stats.emergency_commands_received >= 3);
+  ok = ok && (stats.webrtc_errors >= 1);
+  ok = ok && (stats.peer_connected_events >= 2);
+  ok = ok && (stats.peer_disconnected_events >= 1);
+  ok = ok && (stats.network_up_events >= 1);
+  ok = ok && (stats.network_down_events >= 1);
+  ok = ok && (stats.heartbeat_lost_events >= 1);
+  ok = ok && (stats.status_updates >= 5);
+  ok = ok && (cursor == expected_modes.size());
+  ok = ok && (final_mode == "AUTO");
+  ok = ok && (!emergency);
+  ok = ok && peer_connected;
+
+  if (!ok) {
+    std::cerr
+        << "Vehicle self-test failed. camera_frames=" << stats.camera_frames
+        << " video_frames_sent=" << stats.video_frames_sent
+        << " telemetry_messages=" << stats.telemetry_messages
+        << " telemetry_sent=" << stats.telemetry_sent
+        << " telemetry_messages_received=" << stats.telemetry_messages_received
+        << " heartbeat_messages=" << stats.heartbeat_messages
+        << " command_acks=" << stats.command_acks
+        << " control_messages_received=" << stats.control_messages_received
+        << " emergency_commands_received=" << stats.emergency_commands_received
+        << " webrtc_errors=" << stats.webrtc_errors
+        << " peer_connected_events=" << stats.peer_connected_events
+        << " peer_disconnected_events=" << stats.peer_disconnected_events
+        << " network_up_events=" << stats.network_up_events
+        << " network_down_events=" << stats.network_down_events
+        << " heartbeat_lost_events=" << stats.heartbeat_lost_events
+        << " status_updates=" << stats.status_updates
+        << " final_mode=" << final_mode
+        << " emergency=" << (emergency ? "true" : "false")
+        << " peer_connected=" << (peer_connected ? "true" : "false")
+        << std::endl;
+    std::cerr << "mode_timeline:";
+    for (const auto& mode : stats.mode_timeline) {
+      std::cerr << " " << mode;
+    }
+    std::cerr << std::endl;
+    return false;
+  }
+
+  std::cout << "VEHICLE_SELF_TEST_PASS camera_frames=" << stats.camera_frames
+            << " telemetry_messages=" << stats.telemetry_messages
+            << " command_acks=" << stats.command_acks << std::endl;
+  std::cout << "VEHICLE_LEGACY_FEATURES_PASS control_messages="
+            << stats.control_messages_received
+            << " emergency_commands=" << stats.emergency_commands_received
+            << " webrtc_errors=" << stats.webrtc_errors
+            << " telemetry_received=" << stats.telemetry_messages_received
+            << " network_events="
+            << (stats.network_up_events + stats.network_down_events +
+                stats.heartbeat_lost_events)
+            << " telemetry_sent=" << stats.telemetry_sent
+            << " video_frames_sent=" << stats.video_frames_sent << std::endl;
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::string config_path;
+  bool show_help = false;
+  bool self_test = false;
+  int run_seconds = 0;
+
+  for (int index = 1; index < argc; ++index) {
+    std::string arg = argv[index];
+    if (arg == "--help" || arg == "-h") {
+      show_help = true;
+      break;
+    }
+    if (arg == "--self-test") {
+      self_test = true;
+      continue;
+    }
+    if (arg == "--run-seconds" && index + 1 < argc) {
+      int parsed = 0;
+      if (!to_int(argv[++index], &parsed)) {
+        std::cerr << "Invalid value for --run-seconds" << std::endl;
+        return 2;
+      }
+      run_seconds = std::max(0, parsed);
+      continue;
+    }
+    if (arg == "--config" && index + 1 < argc) {
+      config_path = argv[++index];
+      continue;
+    }
+    if (!arg.empty() && arg[0] != '-') {
+      config_path = arg;
+      continue;
+    }
+    std::cerr << "Unknown argument: " << arg << std::endl;
+    return 2;
+  }
+
+  if (show_help) {
+    std::cout << "Usage: vehicle_client_app --config <path> [--self-test] "
+                 "[--run-seconds N]"
+              << std::endl;
+    return 0;
+  }
+
+  if (config_path.empty()) {
+    std::cerr << "Missing required config path." << std::endl;
+    return 2;
+  }
+
+  if (!std::filesystem::exists(config_path)) {
+    std::cerr << "Config file not found: " << config_path << std::endl;
+    return 3;
+  }
+
+  RuntimeConfig config;
+  if (!load_config(config_path, &config)) {
+    return 4;
+  }
+
+  g_stop_requested = false;
+  std::signal(SIGINT, signal_handler);
+  std::signal(SIGTERM, signal_handler);
+
+  RuntimeState runtime;
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    vehicle_domain::PushMode(&runtime, runtime.mode);
+  }
+
+  std::cout << "Vehicle client started. role=vehicle client_id="
+            << config.client_id << " config=" << config_path << std::endl;
+
+  std::thread camera_thread(camera_loop, &runtime, std::cref(config));
+  std::thread telemetry_thread(telemetry_loop, &runtime, std::cref(config));
+  std::unique_ptr<std::thread> heartbeat_thread;
+  if (config.heartbeat_interval_ms > 0) {
+    heartbeat_thread = std::make_unique<std::thread>(heartbeat_loop, &runtime,
+                                                     std::cref(config));
+  } else {
+    std::cout << "[vehicle/heartbeat] disabled interval_ms=0" << std::endl;
+  }
+
+  bool success = true;
+  if (self_test) {
+    success = run_self_test(&runtime, config);
+    g_stop_requested = true;
+  } else if (run_seconds > 0) {
+    std::this_thread::sleep_for(std::chrono::seconds(run_seconds));
+    g_stop_requested = true;
+  } else {
+    while (!g_stop_requested) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
+
+  if (camera_thread.joinable()) {
+    camera_thread.join();
+  }
+  if (telemetry_thread.joinable()) {
+    telemetry_thread.join();
+  }
+  if (heartbeat_thread && heartbeat_thread->joinable()) {
+    heartbeat_thread->join();
+  }
+
+  RuntimeStats final_stats;
+  std::string final_mode;
+  bool final_emergency = false;
+  bool final_peer_connected = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    final_stats = runtime.stats;
+    final_mode = runtime.mode;
+    final_emergency = runtime.emergency;
+    final_peer_connected = runtime.peer_connected;
+  }
+
+  std::cout << "Vehicle client stopped. mode=" << final_mode
+            << " emergency=" << (final_emergency ? "true" : "false")
+            << " peer_connected=" << (final_peer_connected ? "true" : "false")
+            << " camera_frames=" << final_stats.camera_frames
+            << " video_frames_sent=" << final_stats.video_frames_sent
+            << " telemetry_messages=" << final_stats.telemetry_messages
+            << " telemetry_sent=" << final_stats.telemetry_sent
+            << " command_acks=" << final_stats.command_acks << std::endl;
+
+  return success ? 0 : 5;
 }

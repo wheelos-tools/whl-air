@@ -1,0 +1,9 @@
+# cockpit client runtime config
+client_id=cockpit_client_alpha
+target_vehicle_id=vehicle_client_alpha
+heartbeat_interval_ms=1000
+telemetry_interval_ms=200
+connect_delay_ms=300
+control_channel_label=control
+telemetry_channel_label=telemetry
+transport_server_port=8899

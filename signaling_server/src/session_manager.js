@@ -27,7 +27,7 @@ function addClient(ws, clientId) {
     // For this simple model, let's register all clients by their ID in the session map initially.
     // This allows lookup by ID. The 'targetId' will be set when they send a JOIN.
     // More complex logic might only add vehicles to the session map.
-     sessions.set(clientId, ws); // Register client by ID in the session map
+    sessions.set(clientId, ws); // Register client by ID in the session map
 }
 
 /**
@@ -57,19 +57,19 @@ function removeClient(ws) {
 
             // If this client was part of a session (had a target or was a target),
             // notify the other peer.
-             // This requires tracking session pairs (e.g., Map<string, string> for id -> targetId)
-             // or iterating through clients to find who targeted this one.
-             // Simple notification: Send a LEAVE message to any peer whose target was clientInfo.id
-             connectedClients.forEach((otherClientInfo, otherWs) => {
+            // This requires tracking session pairs (e.g., Map<string, string> for id -> targetId)
+            // or iterating through clients to find who targeted this one.
+            // Simple notification: Send a LEAVE message to any peer whose target was clientInfo.id
+            connectedClients.forEach((otherClientInfo, otherWs) => {
                 if (otherClientInfo.targetId === clientInfo.id) {
                     console.log(`SessionManager: Notifying client ${otherClientInfo.id} that target ${clientInfo.id} left.`);
-                     sendMessage(otherWs, {
-                         type: 'leave',
-                         from: clientInfo.id,
-                         to: otherClientInfo.id,
-                         reason: 'Peer disconnected'
-                     });
-                     // Optional: Clear targetId for the other client or manage session state
+                    sendMessage(otherWs, {
+                        type: 'leave',
+                        from: clientInfo.id,
+                        to: otherClientInfo.id,
+                        reason: 'Peer disconnected'
+                    });
+                    // Optional: Clear targetId for the other client or manage session state
                 }
             });
 
@@ -99,36 +99,51 @@ function routeMessage(senderWs, message) {
         return; // Should not happen if logic is correct
     }
 
+    // Backward-compatible envelope support: { type: 'signaling', payload: {...} }
+    let normalizedMessage = message;
+    if (message.type === 'signaling' && message.payload && typeof message.payload === 'object') {
+        normalizedMessage = {
+            ...message.payload,
+            from: message.from || senderInfo.id,
+            to: message.to || message.targetPeerId || senderInfo.targetId || ''
+        };
+    }
+
+    // Normalize candidate m-line key for cross-implementation compatibility.
+    if (normalizedMessage.type === 'candidate' && normalizedMessage.sdpMLineIndex === undefined && normalizedMessage.sdpMlineIndex !== undefined) {
+        normalizedMessage.sdpMLineIndex = normalizedMessage.sdpMlineIndex;
+    }
+
     // Validate 'from' field matches authenticated sender ID
-    if (message.from !== senderInfo.id) {
+    if (normalizedMessage.from !== senderInfo.id) {
         console.warn(`SessionManager: Received message from ${senderInfo.id} claiming to be from ${message.from}. Ignoring.`);
         // Optional: Send error back to sender
         return;
     }
 
-    console.log(`SessionManager: Routing message type '${message.type}' from ${message.from} to ${message.to || 'server'}.`);
+    console.log(`SessionManager: Routing message type '${normalizedMessage.type}' from ${normalizedMessage.from} to ${normalizedMessage.to || 'server'}.`);
 
     // Handle specific message types
-    switch (message.type) {
+    switch (normalizedMessage.type) {
         case 'join': {
             // Client requests to join a session or connect to a target peer
-            const targetVehicleId = message.data ? message.data.targetVehicleId : null;
+            const targetVehicleId = normalizedMessage.data ? normalizedMessage.data.targetVehicleId : null;
             if (!targetVehicleId) {
                 console.warn(`SessionManager: JOIN message from ${senderInfo.id} missing targetVehicleId.`);
-                 // Optional: Send error back to sender
+                // Optional: Send error back to sender
                 return;
             }
 
             // Store the target ID for this sender (this client wants to talk to targetVehicleId)
             senderInfo.targetId = targetVehicleId;
-             console.log(`SessionManager: Client ${senderInfo.id} set target to ${targetVehicleId}.`);
+            console.log(`SessionManager: Client ${senderInfo.id} set target to ${targetVehicleId}.`);
 
 
             // Check if the target vehicle is currently connected and registered in sessions
             const targetWs = sessions.get(targetVehicleId);
 
             if (targetWs && connectedClients.has(targetWs)) {
-                 console.log(`SessionManager: Target vehicle ${targetVehicleId} found for ${senderInfo.id}. Initiating session.`);
+                console.log(`SessionManager: Target vehicle ${targetVehicleId} found for ${senderInfo.id}. Initiating session.`);
 
                 // Notify both peers they are linked (optional messages)
                 // You could send a custom 'session_established' message
@@ -147,48 +162,48 @@ function routeMessage(senderWs, message) {
             } else {
                 console.warn(`SessionManager: Target vehicle ${targetVehicleId} not found for ${senderInfo.id}.`);
                 // Optional: Send error back to sender (e.g., { type: 'error', message: 'Target not found' })
-                 sendMessage(senderWs, {
-                     type: 'error',
-                     from: 'server',
-                     to: senderInfo.id,
-                     message: `Target vehicle ${targetVehicleId} not found or offline.`
-                 });
+                sendMessage(senderWs, {
+                    type: 'error',
+                    from: 'server',
+                    to: senderInfo.id,
+                    message: `Target vehicle ${targetVehicleId} not found or offline.`
+                });
                 // Optional: Clear targetId or queue the request
-                 senderInfo.targetId = null; // Clear target if not found
+                senderInfo.targetId = null; // Clear target if not found
             }
             break;
         }
-         case 'leave': {
-             // Client requests to leave the session
-             const targetId = senderInfo.targetId; // Get the peer they were connected to
-             if (targetId) {
-                 const targetWs = sessions.get(targetId);
-                  if (targetWs && connectedClients.has(targetWs)) {
-                       console.log(`SessionManager: Client ${senderInfo.id} is leaving session with ${targetId}. Notifying target.`);
-                       // Send a LEAVE message to the other peer
-                       sendMessage(targetWs, {
-                           type: 'leave',
-                           from: senderInfo.id,
-                           to: targetId,
-                           reason: message.reason || 'Peer left session'
-                       });
-                  } else {
-                       console.warn(`SessionManager: Client ${senderInfo.id} is leaving, but target ${targetId} not found.`);
-                  }
-             }
-             // Clear target ID and session state for the sender
-             senderInfo.targetId = null;
-             console.log(`SessionManager: Client ${senderInfo.id} left session.`);
-             break;
-         }
+        case 'leave': {
+            // Client requests to leave the session
+            const targetId = senderInfo.targetId; // Get the peer they were connected to
+            if (targetId) {
+                const targetWs = sessions.get(targetId);
+                if (targetWs && connectedClients.has(targetWs)) {
+                    console.log(`SessionManager: Client ${senderInfo.id} is leaving session with ${targetId}. Notifying target.`);
+                    // Send a LEAVE message to the other peer
+                    sendMessage(targetWs, {
+                        type: 'leave',
+                        from: senderInfo.id,
+                        to: targetId,
+                        reason: normalizedMessage.reason || 'Peer left session'
+                    });
+                } else {
+                    console.warn(`SessionManager: Client ${senderInfo.id} is leaving, but target ${targetId} not found.`);
+                }
+            }
+            // Clear target ID and session state for the sender
+            senderInfo.targetId = null;
+            console.log(`SessionManager: Client ${senderInfo.id} left session.`);
+            break;
+        }
         case 'offer':
         case 'answer':
         case 'candidate': {
             // Standard WebRTC signaling messages
-            const recipientId = message.to;
+            const recipientId = normalizedMessage.to;
             if (!recipientId) {
-                console.warn(`SessionManager: Received '${message.type}' message from ${senderInfo.id} with no recipient ('to' field).`);
-                 // Optional: Send error back to sender
+                console.warn(`SessionManager: Received '${normalizedMessage.type}' message from ${senderInfo.id} with no recipient ('to' field).`);
+                // Optional: Send error back to sender
                 return;
             }
 
@@ -199,9 +214,9 @@ function routeMessage(senderWs, message) {
                 // Ensure sender is allowed to send to this recipient if implementing stricter access control
                 // For 1:1, you might check if sender's targetId is recipientId, and recipient's targetId is senderId.
 
-                console.log(`SessionManager: Routing '${message.type}' from ${message.from} to ${recipientId}.`);
+                console.log(`SessionManager: Routing '${normalizedMessage.type}' from ${normalizedMessage.from} to ${recipientId}.`);
                 // Forward the message directly to the recipient
-                sendMessage(recipientWs, message);
+                sendMessage(recipientWs, normalizedMessage);
 
             } else {
                 console.warn(`SessionManager: Recipient ${recipientId} not found or offline for message from ${senderInfo.id}.`);
@@ -218,7 +233,7 @@ function routeMessage(senderWs, message) {
         // Add other application-specific message types if needed (e.g., chat, status updates)
         default:
             console.warn(`SessionManager: Received unknown message type '${message.type}' from ${message.from}.`);
-             // Optional: Send error back to sender
+            // Optional: Send error back to sender
             sendMessage(senderWs, {
                 type: 'error',
                 from: 'server',

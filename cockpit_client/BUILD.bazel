@@ -1,0 +1,17 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["cockpit_client_app"])
+
+cc_library(
+    name = "domain_runtime_state_lib",
+    srcs = ["domain/runtime_state.cc"],
+    hdrs = ["domain/runtime_state.h"],
+    copts = ["-std=c++17"],
+)
+
+cc_binary(
+    name = "cockpit_client_app_bin",
+    srcs = ["cockpit_client_app.cc"],
+    copts = ["-std=c++17"],
+    deps = [":domain_runtime_state_lib"],
+)

@@ -4,12 +4,16 @@
   "description": "WebRTC signaling server for whl-air remote driving system",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test:route": "node --test tests/session_manager_route.test.js",
+    "test:contract": "node --test tests/contract_signaling_proto.test.js",
+    "test:integration": "node --test tests/server_integration.test.js",
+    "test:all": "npm run test:route && npm run test:contract && npm run test:integration",
+    "test:full": "../scripts/verify_signaling_full.sh"
   },
   "dependencies": {
-    "ws": "^8.0.0",             // Fast WebSocket library
-    "jsonwebtoken": "^9.0.0"  // For JWT verification
-    // Add a config library if needed, e.g., 'config' or handle via env vars
+    "ws": "^8.0.0",
+    "jsonwebtoken": "^9.0.0"
   },
   "keywords": [
     "webrtc",

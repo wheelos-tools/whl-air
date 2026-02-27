@@ -1,0 +1,137 @@
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "signaling_headers",
+    actual = "//signaling:signaling_headers",
+)
+
+alias(
+    name = "signaling_client_base_lib",
+    actual = "//signaling:signaling_client_base_lib",
+)
+
+alias(
+    name = "signaling_message_lib",
+    actual = "//signaling:signaling_message_lib",
+)
+
+alias(
+    name = "webrtc_headers",
+    actual = "//webrtc:webrtc_headers",
+)
+
+alias(
+    name = "webrtc_manager_lib",
+    actual = "//webrtc:webrtc_manager_lib",
+)
+
+cc_binary(
+    name = "rtc_sanity_smoke",
+    srcs = ["tests/rtc_sanity_smoke.cc"],
+    copts = ["-std=c++17"],
+)
+
+cc_test(
+    name = "rtc_sanity_smoke_test",
+    srcs = ["tests/rtc_sanity_smoke.cc"],
+    copts = ["-std=c++17"],
+)
+
+cc_test(
+    name = "rtc_headers_compile_test",
+    srcs = ["tests/rtc_headers_compile_test.cc"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":signaling_headers",
+        ":webrtc_headers",
+    ],
+)
+
+cc_test(
+    name = "webrtc_manager_compile_test",
+    srcs = ["tests/webrtc_manager_compile_test.cc"],
+    copts = ["-std=c++17"],
+    deps = [":webrtc_manager_lib"],
+)
+
+cc_test(
+    name = "signaling_message_test",
+    srcs = ["tests/signaling_message_test.cc"],
+    copts = ["-std=c++17"],
+    deps = [":signaling_message_lib"],
+)
+
+cc_test(
+    name = "signaling_proto_contract_test",
+    srcs = ["tests/signaling_proto_contract_test.cc"],
+    copts = ["-std=c++17"],
+    data = [
+        "contracts/proto_contract_rules.txt",
+        "contracts/signaling_envelope_contract_cases.txt",
+        "proto/remote_command.proto",
+    ],
+    deps = [":signaling_message_lib"],
+)
+
+cc_test(
+    name = "cockpit_runtime_state_test",
+    srcs = ["tests/cockpit_runtime_state_test.cc"],
+    copts = ["-std=c++17"],
+    deps = ["//cockpit_client:domain_runtime_state_lib"],
+)
+
+cc_test(
+    name = "vehicle_runtime_state_test",
+    srcs = ["tests/vehicle_runtime_state_test.cc"],
+    copts = ["-std=c++17"],
+    deps = ["//vehicle_client:domain_runtime_state_lib"],
+)
+
+alias(
+    name = "vehicle_client_app_bin",
+    actual = "//vehicle_client:vehicle_client_app_bin",
+)
+
+alias(
+    name = "cockpit_client_app_bin",
+    actual = "//cockpit_client:cockpit_client_app_bin",
+)
+
+sh_test(
+    name = "client_launchers_smoke_test",
+    srcs = ["tests/client_launchers_smoke_test.sh"],
+    args = [
+        "$(location //vehicle_client:vehicle_client_app_bin)",
+        "$(location //cockpit_client:cockpit_client_app_bin)",
+        "$(location //vehicle_client:vehicle_client_app)",
+        "$(location //cockpit_client:cockpit_client_app)",
+    ],
+    data = [
+        "//vehicle_client:vehicle_client_app_bin",
+        "//cockpit_client:cockpit_client_app_bin",
+        "//vehicle_client:vehicle_client_app",
+        "//cockpit_client:cockpit_client_app",
+    ],
+)
+
+sh_test(
+    name = "vehicle_client_functional_test",
+    srcs = ["tests/vehicle_client_functional_test.sh"],
+    args = [
+        "$(location //vehicle_client:vehicle_client_app_bin)",
+    ],
+    data = [
+        "//vehicle_client:vehicle_client_app_bin",
+    ],
+)
+
+sh_test(
+    name = "cockpit_client_functional_test",
+    srcs = ["tests/cockpit_client_functional_test.sh"],
+    args = [
+        "$(location //cockpit_client:cockpit_client_app_bin)",
+    ],
+    data = [
+        "//cockpit_client:cockpit_client_app_bin",
+    ],
+)

@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTC Integration Test</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    button { margin-right: 8px; padding: 8px 12px; }
+    .row { display: flex; gap: 16px; margin-top: 12px; }
+    video { width: 360px; height: 240px; background: #111; border-radius: 6px; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 6px; min-height: 220px; }
+    .ok { color: #0a7f2e; }
+    .err { color: #b00020; }
+    .warn { color: #9a6700; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC Integration Test (Media + Command + NAT Traversal)</h2>
+  <p>Checks camera media transfer, command round-trip over DataChannel, and ICE non-host candidates (srflx/relay).</p>
+
+  <div>
+    <button id="btnRun">Run Integration Test</button>
+    <button id="btnReset">Reset</button>
+    <span id="status">Idle</span>
+  </div>
+
+  <div class="row">
+    <div>
+      <h4>Local</h4>
+      <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+    <div>
+      <h4>Remote</h4>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <h3>Log</h3>
+  <pre id="log"></pre>
+
+  <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+  <script>
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+
+    let localStream = null;
+    let pc1 = null;
+    let pc2 = null;
+    let cmdDc1 = null;
+    let cmdDc2 = null;
+
+    const candidateTypeSeen = {
+      pc1: new Set(),
+      pc2: new Set(),
+    };
+
+    function log(msg, cls = '') {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      if (cls) line.className = cls;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg, cls = '') {
+      statusEl.textContent = msg;
+      statusEl.className = cls;
+    }
+
+    function parseCandidateType(candidateText) {
+      if (!candidateText) return null;
+      const m = candidateText.match(/ typ ([a-zA-Z0-9]+)/);
+      return m ? m[1].toLowerCase() : null;
+    }
+
+    function recordCandidate(peerName, candidate) {
+      const type = parseCandidateType(candidate?.candidate || '');
+      if (!type) return;
+      candidateTypeSeen[peerName].add(type);
+      log(`${peerName} candidate type: ${type}`);
+    }
+
+    async function wait(ms) {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function cleanup() {
+      try { if (cmdDc1) cmdDc1.close(); } catch {}
+      try { if (cmdDc2) cmdDc2.close(); } catch {}
+      try { if (pc1) pc1.close(); } catch {}
+      try { if (pc2) pc2.close(); } catch {}
+      cmdDc1 = null;
+      cmdDc2 = null;
+      pc1 = null;
+      pc2 = null;
+
+      if (localStream) {
+        for (const track of localStream.getTracks()) track.stop();
+      }
+      localStream = null;
+      localVideo.srcObject = null;
+      remoteVideo.srcObject = null;
+      candidateTypeSeen.pc1.clear();
+      candidateTypeSeen.pc2.clear();
+    }
+
+    async function assertVideoFlow() {
+      const remoteTrackPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('remote ontrack timeout')), 15000);
+        pc2.ontrack = async (event) => {
+          remoteVideo.srcObject = event.streams[0];
+          log(`pc2 ontrack kind=${event.track.kind}`);
+          clearTimeout(timeout);
+          await wait(1200);
+          resolve();
+        };
+      });
+
+      for (const track of localStream.getVideoTracks()) {
+        pc1.addTrack(track, localStream);
+        log(`pc1 addTrack kind=${track.kind}`);
+      }
+
+      const offer = await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(offer);
+      log('Offer applied');
+
+      const answer = await pc2.createAnswer();
+      await pc2.setLocalDescription(answer);
+      await pc1.setRemoteDescription(answer);
+      log('Answer applied');
+
+      await remoteTrackPromise;
+
+      const stats = await pc2.getStats();
+      let hasInboundVideoPackets = false;
+      stats.forEach((report) => {
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          if ((report.packetsReceived || 0) > 0 || (report.bytesReceived || 0) > 0) {
+            hasInboundVideoPackets = true;
+          }
+        }
+      });
+
+      if (!hasInboundVideoPackets) {
+        throw new Error('video inbound RTP stats not observed');
+      }
+      log('Video flow verified via inbound RTP stats', 'ok');
+    }
+
+    async function assertCommandFlow() {
+      const ackPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('command ack timeout')), 10000);
+
+        cmdDc1 = pc1.createDataChannel('command');
+        cmdDc1.onopen = () => {
+          const cmd = { cmd: 'EMERGENCY_STOP', ts: Date.now() };
+          log(`cmdDc1 open, send ${JSON.stringify(cmd)}`);
+          cmdDc1.send(JSON.stringify(cmd));
+        };
+        cmdDc1.onmessage = (e) => {
+          log(`cmdDc1 recv ${e.data}`);
+          try {
+            const obj = JSON.parse(e.data);
+            if (obj.ack === 'EMERGENCY_STOP') {
+              clearTimeout(timeout);
+              resolve();
+            }
+          } catch (err) {
+            reject(new Error(`invalid ack json: ${err.message}`));
+          }
+        };
+
+        pc2.ondatachannel = (event) => {
+          cmdDc2 = event.channel;
+          log(`cmdDc2 received channel ${cmdDc2.label}`);
+          cmdDc2.onmessage = (e) => {
+            log(`cmdDc2 recv ${e.data}`);
+            let obj = null;
+            try {
+              obj = JSON.parse(e.data);
+            } catch {
+              return;
+            }
+            if (obj.cmd === 'EMERGENCY_STOP') {
+              cmdDc2.send(JSON.stringify({ ack: 'EMERGENCY_STOP', ts: Date.now() }));
+            }
+          };
+        };
+      });
+
+      await ackPromise;
+      log('Command round-trip over DataChannel verified', 'ok');
+    }
+
+    function assertNatTraversal() {
+      const p1 = candidateTypeSeen.pc1;
+      const p2 = candidateTypeSeen.pc2;
+      const foundNonHost = ['srflx', 'relay'].some((t) => p1.has(t) || p2.has(t));
+
+      log(`pc1 candidate types: ${Array.from(p1).join(', ') || '(none)'}`);
+      log(`pc2 candidate types: ${Array.from(p2).join(', ') || '(none)'}`);
+
+      if (!foundNonHost) {
+        throw new Error('no srflx/relay ICE candidate found; NAT traversal not proven');
+      }
+      log('NAT traversal capability verified (srflx/relay candidate present)', 'ok');
+    }
+
+    async function runIntegrationTest() {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Running...', '');
+
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        localVideo.srcObject = localStream;
+        log('getUserMedia success');
+
+        const rtcConfig = {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+          ],
+        };
+
+        pc1 = new RTCPeerConnection(rtcConfig);
+        pc2 = new RTCPeerConnection(rtcConfig);
+
+        pc1.onicecandidate = (e) => {
+          if (!e.candidate) return;
+          recordCandidate('pc1', e.candidate);
+          pc2.addIceCandidate(e.candidate).catch((err) => log(`pc2 addIceCandidate failed: ${err}`, 'err'));
+        };
+
+        pc2.onicecandidate = (e) => {
+          if (!e.candidate) return;
+          recordCandidate('pc2', e.candidate);
+          pc1.addIceCandidate(e.candidate).catch((err) => log(`pc1 addIceCandidate failed: ${err}`, 'err'));
+        };
+
+        await Promise.all([assertCommandFlow(), assertVideoFlow()]);
+        await wait(1000);
+        assertNatTraversal();
+
+        const iceOk = ['connected', 'completed'].includes(pc1.iceConnectionState) ||
+                      ['connected', 'completed'].includes(pc2.iceConnectionState);
+        if (!iceOk) {
+          throw new Error(`ICE state not connected/completed (pc1=${pc1.iceConnectionState}, pc2=${pc2.iceConnectionState})`);
+        }
+
+        setStatus('PASS: media + command + NAT traversal checks passed', 'ok');
+      } catch (err) {
+        setStatus(`FAIL: ${err.message || err}`, 'err');
+        log(`Integration test failed: ${err.stack || err}`, 'err');
+      }
+    }
+
+    document.getElementById('btnRun').addEventListener('click', runIntegrationTest);
+    document.getElementById('btnReset').addEventListener('click', () => {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Idle', '');
+    });
+  </script>
+</body>
+</html>

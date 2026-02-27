@@ -20,6 +20,18 @@
 #include <string>
 #include <vector>
 
+#ifndef GUARDED_BY
+#define GUARDED_BY(x)
+#endif
+
+#ifndef REQUIRES
+#define REQUIRES(x)
+#endif
+
+#ifndef EXCLUDES
+#define EXCLUDES(x)
+#endif
+
 // Forward declare concrete implementations (managed by unique_ptr/factories)
 // class SignalingClientImpl; // Concrete signaling client
 // class LibwebrtcPeerConnection; // Concrete PeerConnection implementation
@@ -32,6 +44,17 @@
 namespace autodev {
 namespace remote {
 namespace webrtc {
+
+enum class AppState {
+  Uninitialized,
+  Initializing,
+  Initialized,
+  Running,
+  Stopping,
+  Stopped,
+};
+
+using PeerConnection = IPeerConnection;
 
 // Configuration struct placeholder (should be defined in config/)
 struct WebrtcConfig {
@@ -155,6 +178,18 @@ class WebrtcManagerImpl : public IWebrtcManager {
           GUARDED_BY(mutex_);  // Track last received time per peer
   std::map<std::string, int> reconnectionAttemptCount_
       GUARDED_BY(mutex_);  // Track reconnection attempts per peer
+
+  struct PendingRemoteCandidate {
+    std::string candidate;
+    std::string sdp_mid;
+    int sdp_mline_index;
+  };
+
+  // Buffer remote ICE candidates that arrive before SetRemoteDescription
+  // succeeds for a peer. Access MUST be protected by mutex_.
+  std::map<std::string, bool> remoteDescriptionSet_ GUARDED_BY(mutex_);
+  std::map<std::string, std::vector<PendingRemoteCandidate>>
+      pendingRemoteCandidates_ GUARDED_BY(mutex_);
 
   // --- Internal Handlers (Called by SignalingClient or PeerConnection
   // Callbacks) --- These methods implement the core logic of the manager. These

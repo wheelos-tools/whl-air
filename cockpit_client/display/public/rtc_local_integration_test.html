@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTC Local Integration Test</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    button { margin-right: 8px; padding: 8px 12px; }
+    .row { display: flex; gap: 16px; margin-top: 12px; }
+    video, canvas { width: 360px; height: 240px; background: #111; border-radius: 6px; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 6px; min-height: 220px; }
+    .ok { color: #0a7f2e; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC Local Integration Test (Mock Video + Command Channel)</h2>
+  <p>Local-only test without camera and without NAT requirement. Uses canvas mock video stream.</p>
+
+  <div>
+    <button id="btnRun">Run Local Test</button>
+    <button id="btnReset">Reset</button>
+    <span id="status">Idle</span>
+  </div>
+
+  <div class="row">
+    <div>
+      <h4>Mock Source (Canvas)</h4>
+      <canvas id="mockCanvas" width="640" height="360"></canvas>
+    </div>
+    <div>
+      <h4>Remote Video (WebRTC)</h4>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <h3>Log</h3>
+  <pre id="log"></pre>
+
+  <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+  <script>
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const mockCanvas = document.getElementById('mockCanvas');
+
+    let pc1 = null;
+    let pc2 = null;
+    let commandChannelTx = null;
+    let commandChannelRx = null;
+    let mockStream = null;
+    let drawTimer = null;
+
+    function log(msg, cls = '') {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      if (cls) line.className = cls;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg, cls = '') {
+      statusEl.textContent = msg;
+      statusEl.className = cls;
+    }
+
+    function startMockCanvasVideo() {
+      const ctx = mockCanvas.getContext('2d');
+      const start = performance.now();
+
+      function drawFrame() {
+        const t = (performance.now() - start) / 1000;
+        const w = mockCanvas.width;
+        const h = mockCanvas.height;
+
+        ctx.fillStyle = '#111827';
+        ctx.fillRect(0, 0, w, h);
+
+        ctx.fillStyle = '#22d3ee';
+        const x = Math.floor((Math.sin(t * 1.2) * 0.4 + 0.5) * (w - 120));
+        const y = Math.floor((Math.cos(t * 0.9) * 0.35 + 0.5) * (h - 80));
+        ctx.fillRect(x, y, 120, 80);
+
+        ctx.fillStyle = '#e5e7eb';
+        ctx.font = '28px sans-serif';
+        ctx.fillText('MOCK VIDEO', 20, 40);
+        ctx.font = '22px monospace';
+        ctx.fillText(new Date().toISOString().slice(11, 23), 20, h - 24);
+      }
+
+      drawFrame();
+      drawTimer = setInterval(drawFrame, 33);
+      mockStream = mockCanvas.captureStream(30);
+      return mockStream;
+    }
+
+    function cleanup() {
+      try { if (commandChannelTx) commandChannelTx.close(); } catch {}
+      try { if (commandChannelRx) commandChannelRx.close(); } catch {}
+      try { if (pc1) pc1.close(); } catch {}
+      try { if (pc2) pc2.close(); } catch {}
+
+      commandChannelTx = null;
+      commandChannelRx = null;
+      pc1 = null;
+      pc2 = null;
+
+      if (mockStream) {
+        for (const track of mockStream.getTracks()) track.stop();
+      }
+      mockStream = null;
+
+      if (drawTimer) {
+        clearInterval(drawTimer);
+        drawTimer = null;
+      }
+
+      remoteVideo.srcObject = null;
+    }
+
+    async function wait(ms) {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function setupPeerConnections() {
+      const rtcConfig = { iceServers: [] };
+      pc1 = new RTCPeerConnection(rtcConfig);
+      pc2 = new RTCPeerConnection(rtcConfig);
+
+      pc1.onicecandidate = (e) => {
+        if (e.candidate) {
+          pc2.addIceCandidate(e.candidate).catch((err) => log(`pc2 addIceCandidate failed: ${err}`, 'err'));
+        }
+      };
+
+      pc2.onicecandidate = (e) => {
+        if (e.candidate) {
+          pc1.addIceCandidate(e.candidate).catch((err) => log(`pc1 addIceCandidate failed: ${err}`, 'err'));
+        }
+      };
+    }
+
+    async function verifyVideoTransfer() {
+      const stream = startMockCanvasVideo();
+      log('Mock canvas stream started');
+
+      const videoTracks = stream.getVideoTracks();
+      if (videoTracks.length === 0) {
+        throw new Error('no mock video track created');
+      }
+
+      for (const track of videoTracks) {
+        pc1.addTrack(track, stream);
+        log(`pc1 addTrack kind=${track.kind}`);
+      }
+
+      const remoteTrackPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('remote ontrack timeout')), 15000);
+        pc2.ontrack = async (event) => {
+          remoteVideo.srcObject = event.streams[0];
+          log(`pc2 ontrack kind=${event.track.kind}`);
+          clearTimeout(timeout);
+          await wait(1200);
+          resolve();
+        };
+      });
+
+      const offer = await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(offer);
+      log('Offer applied');
+
+      const answer = await pc2.createAnswer();
+      await pc2.setLocalDescription(answer);
+      await pc1.setRemoteDescription(answer);
+      log('Answer applied');
+
+      await remoteTrackPromise;
+
+      const stats = await pc2.getStats();
+      let hasInboundVideoPackets = false;
+      stats.forEach((report) => {
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          if ((report.packetsReceived || 0) > 0 || (report.bytesReceived || 0) > 0) {
+            hasInboundVideoPackets = true;
+          }
+        }
+      });
+
+      if (!hasInboundVideoPackets) {
+        throw new Error('video inbound RTP stats not observed');
+      }
+      log('Video transfer verified via inbound RTP stats', 'ok');
+    }
+
+    function prepareCommandTransfer() {
+      const ackPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('command ack timeout')), 10000);
+
+        pc2.ondatachannel = (event) => {
+          commandChannelRx = event.channel;
+          log(`command rx channel ${commandChannelRx.label}`);
+          commandChannelRx.onmessage = (e) => {
+            log(`command rx recv ${e.data}`);
+            let data = null;
+            try {
+              data = JSON.parse(e.data);
+            } catch {
+              return;
+            }
+            if (data.cmd === 'FORWARD') {
+              commandChannelRx.send(JSON.stringify({ ack: 'FORWARD', ts: Date.now() }));
+            }
+          };
+        };
+
+        commandChannelTx = pc1.createDataChannel('control');
+        commandChannelTx.onopen = () => {
+          const payload = { cmd: 'FORWARD', value: 0.35, ts: Date.now() };
+          log(`command tx send ${JSON.stringify(payload)}`);
+          commandChannelTx.send(JSON.stringify(payload));
+        };
+
+        commandChannelTx.onmessage = (e) => {
+          log(`command tx recv ${e.data}`);
+          try {
+            const data = JSON.parse(e.data);
+            if (data.ack === 'FORWARD') {
+              clearTimeout(timeout);
+              resolve();
+            }
+          } catch (err) {
+            clearTimeout(timeout);
+            reject(new Error(`invalid command ack json: ${err.message}`));
+          }
+        };
+      });
+
+      return ackPromise;
+    }
+
+    async function runLocalTest() {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Running...', '');
+
+      try {
+        await setupPeerConnections();
+        const commandAckPromise = prepareCommandTransfer();
+        await verifyVideoTransfer();
+        await commandAckPromise;
+        log('Control command transfer verified', 'ok');
+
+        const iceConnected = ['connected', 'completed'].includes(pc1.iceConnectionState) ||
+                             ['connected', 'completed'].includes(pc2.iceConnectionState);
+        if (!iceConnected) {
+          throw new Error(`ICE not connected/completed (pc1=${pc1.iceConnectionState}, pc2=${pc2.iceConnectionState})`);
+        }
+
+        setStatus('PASS: local mock video + control command transfer verified', 'ok');
+      } catch (err) {
+        setStatus(`FAIL: ${err.message || err}`, 'err');
+        log(`Local integration test failed: ${err.stack || err}`, 'err');
+      }
+    }
+
+    document.getElementById('btnRun').addEventListener('click', runLocalTest);
+    document.getElementById('btnReset').addEventListener('click', () => {
+      cleanup();
+      logEl.innerHTML = '';
+      setStatus('Idle', '');
+    });
+  </script>
+</body>
+</html>

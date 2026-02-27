@@ -1,6 +1,6 @@
 // signaling_client/src/signaling_message.cc
 
-#include "include/webrtc/signaling_message.h"  // Assuming include path
+#include "signaling/signaling_message.h"
 
 #include <iostream>
 #include <map>  // For the maps
@@ -39,6 +39,14 @@ const std::map<std::string, SignalMessage::Type> stringToTypeMap = {
     {"candidate", SignalMessage::Type::CANDIDATE}};
 }  // anonymous namespace
 
+std::string SignalMessage::TypeToString(SignalMessage::Type type) {
+  auto it = typeToStringMap.find(type);
+  if (it != typeToStringMap.end()) {
+    return it->second;
+  }
+  return "unknown";
+}
+
 // Implementation of the static member function
 SignalMessage::Type SignalMessage::StringToType(const std::string& typeStr) {
   auto it = stringToTypeMap.find(typeStr);
@@ -62,9 +70,13 @@ std::string SerializeSignalMessage(const SignalMessage& message) {
     json_str += ",\"candidate\":{";
     json_str += "\"candidate\":\"" + *message.candidate + "\"";
     if (message.sdpMid) json_str += ",\"sdpMid\":\"" + *message.sdpMid + "\"";
-    if (message.sdpMlineIndex)
+    if (message.sdpMlineIndex) {
+      // Keep both spellings for backward compatibility across JS/C++ paths.
       json_str +=
           ",\"sdpMlineIndex\":" + std::to_string(*message.sdpMlineIndex);
+      json_str +=
+          ",\"sdpMLineIndex\":" + std::to_string(*message.sdpMlineIndex);
+    }
     json_str += "}";
   }
   if (message.reason) json_str += ",\"reason\":\"" + *message.reason + "\"";
@@ -136,37 +148,66 @@ std::optional<SignalMessage> DeserializeSignalMessage(const std::string& data) {
   // --- Simple Skeleton Parser (Highly Fragile) ---
   SignalMessage msg;
   try {
+    auto findQuotedValue =
+        [&data](const std::string& key) -> std::optional<std::string> {
+      std::string token = "\"" + key + "\":\"";
+      size_t pos = data.find(token);
+      if (pos == std::string::npos) return std::nullopt;
+      size_t start = pos + token.size();
+      size_t end = data.find("\"", start);
+      if (end == std::string::npos) return std::nullopt;
+      return data.substr(start, end - start);
+    };
+
+    auto findIntValue = [&data](const std::string& key) -> std::optional<int> {
+      std::string token = "\"" + key + "\":";
+      size_t pos = data.find(token);
+      if (pos == std::string::npos) return std::nullopt;
+      size_t start = pos + token.size();
+      size_t end = data.find_first_of(",}", start);
+      if (end == std::string::npos) return std::nullopt;
+      try {
+        return std::stoi(data.substr(start, end - start));
+      } catch (...) {
+        return std::nullopt;
+      }
+    };
+
     // This is a very basic parser assuming field order and simple values. NOT
     // ROBUST.
-    size_t type_pos = data.find("\"type\":\"");
-    if (type_pos != std::string::npos) {
-      size_t start = type_pos + 8;
-      size_t end = data.find("\"", start);
-      if (end != std::string::npos) {
-        msg.type = SignalMessage::StringToType(data.substr(start, end - start));
-      }
+    if (auto type = findQuotedValue("type"); type) {
+      msg.type = SignalMessage::StringToType(*type);
     }
 
-    size_t from_pos = data.find("\"from\":\"");
-    if (from_pos != std::string::npos) {
-      size_t start = from_pos + 8;
-      size_t end = data.find("\"", start);
-      if (end != std::string::npos) {
-        msg.from = data.substr(start, end - start);
-      }
+    if (auto from = findQuotedValue("from"); from) {
+      msg.from = *from;
     }
 
-    size_t to_pos = data.find("\"to\":\"");
-    if (to_pos != std::string::npos) {
-      size_t start = to_pos + 6;
-      size_t end = data.find("\"", start);
-      if (end != std::string::npos) {
-        msg.to = data.substr(start, end - start);
-      }
+    if (auto to = findQuotedValue("to"); to) {
+      msg.to = *to;
     }
 
-    // Add similar simple logic for sdp, candidate, etc. - this gets complex
-    // fast.
+    if (auto sdp = findQuotedValue("sdp"); sdp) {
+      msg.sdp = *sdp;
+    }
+
+    if (auto reason = findQuotedValue("reason"); reason) {
+      msg.reason = *reason;
+    }
+
+    // Supports both nested and flat candidate formats.
+    if (auto candidate = findQuotedValue("candidate"); candidate) {
+      msg.candidate = *candidate;
+    }
+    if (auto sdp_mid = findQuotedValue("sdpMid"); sdp_mid) {
+      msg.sdpMid = *sdp_mid;
+    }
+    if (auto sdp_mline = findIntValue("sdpMlineIndex"); sdp_mline) {
+      msg.sdpMlineIndex = *sdp_mline;
+    } else if (auto sdp_mline_compat = findIntValue("sdpMLineIndex");
+               sdp_mline_compat) {
+      msg.sdpMlineIndex = *sdp_mline_compat;
+    }
 
     // std::cout << "Deserialized (Skeleton): Type=" <<
     // SignalMessage::TypeToString(msg.type) << ", From=" << msg.from << ", To="

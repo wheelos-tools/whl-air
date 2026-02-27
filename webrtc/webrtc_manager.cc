@@ -1,4 +1,4 @@
-#include "webrtc_manager_impl.h"  // Include the implementation header
+#include "webrtc/webrtc_manager.h"  // Include the implementation header
 
 // Include concrete implementations (linked, not included as .cc)
 // #include "signaling/websocket_signaling_client.h" // Concrete signaling
@@ -79,21 +79,9 @@ bool WebrtcManagerImpl::init(/* const WebrtcConfig& webrtc_config, EventLoopCont
   //    config_.signaling_uri, config_.signaling_jwt, event_loop_, this); //
   //    Pass config, context, and 'this' as handler sink
 
-  // Dummy creation for skeleton
-  signalingClient_ = std::make_unique<SignalingClientImpl>(
-      "ws://dummy", "", this);  // Dummy config for skeleton
-
-  // Set handlers for the signaling client (Callbacks are implemented below)
-  // These handlers will be called by the signaling client's thread; they must
-  // acquire mutex_.
-  signalingClient_->onConnected(
-      std::bind(&WebrtcManagerImpl::handleSignalingConnected, this));
-  signalingClient_->onDisconnected(
-      std::bind(&WebrtcManagerImpl::handleSignalingDisconnected, this));
-  signalingClient_->onError(std::bind(&WebrtcManagerImpl::handleSignalingError,
-                                      this, std::placeholders::_1));
-  signalingClient_->onMessageReceived(std::bind(
-      &WebrtcManagerImpl::handleSignalingMessage, this, std::placeholders::_1));
+  // Skeleton mode: no concrete signaling implementation is wired here yet.
+  // Keep a null signaling client until real dependency wiring is complete.
+  signalingClient_.reset();
 
   // TODO: Initialize heartbeat timer if enabled in config
   // if (config_.heartbeat_interval_ms > 0) {
@@ -239,9 +227,9 @@ bool WebrtcManagerImpl::connectToPeer(const std::string& peer_id) {
         handlePeerIceConnectionStateChange(
             peer_id, state);  // This handler ACQUIREs mutex_
       };
-  pc_callbacks.onSignalingStateChange = [this, peer_id](int state) {
-    handlePeerSignalingStateChange(peer_id,
-                                   state);  // This handler ACQUIREs mutex_
+  pc_callbacks.onSignalingStateChange = [this, peer_id](SignalingState state) {
+    handlePeerSignalingStateChange(
+        peer_id, static_cast<int>(state));  // This handler ACQUIREs mutex_
   };
   pc_callbacks.onDataChannelOpened = [this, peer_id](const std::string& label) {
     handlePeerDataChannelOpened(peer_id,
@@ -430,154 +418,169 @@ void WebrtcManagerImpl::onDataChannelMessageReceived(
 // mutex_.
 
 void WebrtcManagerImpl::handleSignalingConnected() {
-  // Called by SignalingClient thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cout << "WebrtcManagerImpl: Signaling connected." << std::endl;
+  OnSignalingConnectedHandler handler;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cout << "WebrtcManagerImpl: Signaling connected." << std::endl;
+    handler = onSignalingConnectedHandler_;
+  }
 
-  // TODO: Send JOIN message to signaling server (needs local client ID from
-  // config) SignalMessage join_msg(SignalMessage::Type::JOIN,
-  // config_.client_id, ""); // To signaling server if (signalingClient_)
-  // signalingClient_->sendSignal(join_msg);
-
-  // Invoke application callback (safely)
-  invokeSignalingConnectedCallback();  // Calls invoke helper which acquires
-                                       // mutex again (or passes func)
+  if (handler) {
+    handler();
+  }
 }
 
 void WebrtcManagerImpl::handleSignalingDisconnected() {
-  // Called by SignalingClient thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cout << "WebrtcManagerImpl: Signaling disconnected." << std::endl;
+  OnSignalingDisconnectedHandler handler;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cout << "WebrtcManagerImpl: Signaling disconnected." << std::endl;
+    handler = onSignalingDisconnectedHandler_;
+  }
 
-  // TODO: Handle peers. Depending on policy, disconnect/clean up PCs if
-  // signaling is essential. Iterating and calling Close() might be okay, but
-  // need to be careful if PC state changes also trigger cleanup logic.
-  // destroyPeerConnection(...) might be called.
-
-  // Invoke application callback (safely)
-  invokeSignalingDisconnectedCallback(
-      "Signaling connection lost");  // Calls invoke helper
+  if (handler) {
+    handler("Signaling connection lost");
+  }
 }
 
 void WebrtcManagerImpl::handleSignalingError(const std::string& msg) {
-  // Called by SignalingClient thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cerr << "WebrtcManagerImpl: Signaling error: " << msg << std::endl;
-  invokeSignalingErrorCallback(msg);  // Calls invoke helper
+  OnSignalingErrorHandler handler;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cerr << "WebrtcManagerImpl: Signaling error: " << msg << std::endl;
+    handler = onSignalingErrorHandler_;
+  }
+
+  if (handler) {
+    handler(msg);
+  }
 }
 
 void WebrtcManagerImpl::handleSignalingMessage(const SignalMessage& message) {
-  // Called by SignalingClient thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cout << "WebrtcManagerImpl: Received signal message from "
-            << message.from
-            << " type=" << SignalMessage::TypeToString(message.type)
-            << std::endl;
+  OnPeerErrorHandler peer_error_handler;
+  OnSignalingErrorHandler signaling_error_handler;
+  std::string peer_error_message;
+  std::string signaling_error_message;
 
-  std::string peer_id = message.from;  // Assuming 'from' is the peer ID
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cout << "WebrtcManagerImpl: Received signal message from "
+              << message.from
+              << " type=" << SignalMessage::TypeToString(message.type)
+              << std::endl;
 
-  // Handle specific message types
-  switch (message.type) {
-    case SignalMessage::Type::JOIN:
-      std::cout << "WebrtcManagerImpl: Peer " << peer_id << " joined."
-                << std::endl;
-      // If this peer initiated the join (we are connecting to them), we might
-      // create offer later. If they joined OUR session, we might need to create
-      // a PeerConnection for them.
-      // For simplicity, let's create or get the PC now.
-      // getOrCreatePeerConnection(peer_id); // This method ACQUIRES mutex_ or
-      // relies on current lock
+    std::string peer_id = message.from;
 
-      // Alternative: Only create PC on Offer/Answer/Candidate to avoid
-      // unnecessary PC creation if (!peerConnections_.count(peer_id)) {
-      //     std::cout << "WebrtcManagerImpl: Ignoring JOIN from unknown peer "
-      //     << peer_id << std::endl;
-      // }
-      break;
-    case SignalMessage::Type::LEAVE:
-      std::cout << "WebrtcManagerImpl: Peer " << peer_id << " left."
-                << std::endl;
-      // Find and close the PeerConnection for this peer
-      if (peerConnections_.count(peer_id)) {
-        // Calling Close() here, cleanup happens in state change handler
-        // destroyPeerConnection(peer_id, "Peer left signaling"); // This method
-        // ACQUIRES mutex_ or relies on current lock
-        if (peerConnections_[peer_id])
-          peerConnections_[peer_id]
-              ->Close();  // Calling Close under lock is generally safe
-      } else {
-        std::cout << "WebrtcManagerImpl: Received LEAVE for unknown peer "
-                  << peer_id << std::endl;
+    switch (message.type) {
+      case SignalMessage::Type::JOIN:
+        std::cout << "WebrtcManagerImpl: Peer " << peer_id << " joined."
+                  << std::endl;
+        break;
+      case SignalMessage::Type::LEAVE:
+        std::cout << "WebrtcManagerImpl: Peer " << peer_id << " left."
+                  << std::endl;
+        if (peerConnections_.count(peer_id) && peerConnections_[peer_id]) {
+          peerConnections_[peer_id]->Close();
+          remoteDescriptionSet_.erase(peer_id);
+          pendingRemoteCandidates_.erase(peer_id);
+        }
+        break;
+      case SignalMessage::Type::OFFER: {
+        PeerConnection* pc = getOrCreatePeerConnection(peer_id);
+        if (pc && message.sdp) {
+          if (pc->SetRemoteDescription("offer", *message.sdp)) {
+            remoteDescriptionSet_[peer_id] = true;
+
+            auto pending_it = pendingRemoteCandidates_.find(peer_id);
+            if (pending_it != pendingRemoteCandidates_.end()) {
+              for (const auto& pending : pending_it->second) {
+                pc->AddRemoteCandidate(pending.candidate, pending.sdp_mid,
+                                       pending.sdp_mline_index);
+              }
+              pendingRemoteCandidates_.erase(pending_it);
+            }
+
+            pc->CreateAnswer();
+          } else {
+            peer_error_handler = onPeerErrorHandler_;
+            peer_error_message =
+                "Failed to set remote OFFER before CreateAnswer for " + peer_id;
+          }
+        } else {
+          std::cerr
+              << "WebrtcManagerImpl: Received OFFER without SDP or PC not "
+                 "created for "
+              << peer_id << std::endl;
+          peer_error_handler = onPeerErrorHandler_;
+          peer_error_message = "Received OFFER with missing SDP or PC";
+        }
+        break;
       }
-      break;
-    case SignalMessage::Type::OFFER: {
-      PeerConnection* pc = getOrCreatePeerConnection(
-          peer_id);  // ACQUIRES mutex_ internally or relies on current lock
-      if (pc && message.sdp) {
-        pc->SetRemoteDescription("offer", *message.sdp);
-        // Assuming this is the ANSWERING side (Vehicle)
-        pc->CreateAnswer();  // Triggers onLocalSdpGenerated callback
-                             // asynchronously
-      } else {
-        std::cerr << "WebrtcManagerImpl: Received OFFER without SDP or PC not "
-                     "created for "
-                  << peer_id << std::endl;
-        invokePeerErrorCallback(
-            peer_id,
-            "Received OFFER with missing SDP or PC");  // Calls invoke helper
+      case SignalMessage::Type::ANSWER: {
+        PeerConnection* pc = getOrCreatePeerConnection(peer_id);
+        if (pc && message.sdp) {
+          if (!pc->SetRemoteDescription("answer", *message.sdp)) {
+            peer_error_handler = onPeerErrorHandler_;
+            peer_error_message = "Failed to set remote ANSWER for " + peer_id;
+          } else {
+            remoteDescriptionSet_[peer_id] = true;
+
+            auto pending_it = pendingRemoteCandidates_.find(peer_id);
+            if (pending_it != pendingRemoteCandidates_.end()) {
+              for (const auto& pending : pending_it->second) {
+                pc->AddRemoteCandidate(pending.candidate, pending.sdp_mid,
+                                       pending.sdp_mline_index);
+              }
+              pendingRemoteCandidates_.erase(pending_it);
+            }
+          }
+        } else {
+          std::cerr
+              << "WebrtcManagerImpl: Received ANSWER without SDP or PC not "
+                 "created for "
+              << peer_id << std::endl;
+          peer_error_handler = onPeerErrorHandler_;
+          peer_error_message = "Received ANSWER with missing SDP or PC";
+        }
+        break;
       }
-      break;
-    }
-    case SignalMessage::Type::ANSWER: {
-      PeerConnection* pc = getOrCreatePeerConnection(
-          peer_id);  // ACQUIRES mutex_ internally or relies on current lock
-      if (pc && message.sdp) {
-        pc->SetRemoteDescription("answer", *message.sdp);
-        // Assuming this is the OFFERING side (Cockpit)
-        // Connection process continues...
-      } else {
-        std::cerr << "WebrtcManagerImpl: Received ANSWER without SDP or PC not "
-                     "created for "
-                  << peer_id << std::endl;
-        invokePeerErrorCallback(
-            peer_id,
-            "Received ANSWER with missing SDP or PC");  // Calls invoke helper
+      case SignalMessage::Type::CANDIDATE: {
+        PeerConnection* pc = getOrCreatePeerConnection(peer_id);
+        if (pc && message.candidate && message.sdpMid &&
+            message.sdpMlineIndex) {
+          if (!remoteDescriptionSet_[peer_id]) {
+            pendingRemoteCandidates_[peer_id].push_back(PendingRemoteCandidate{
+                *message.candidate, *message.sdpMid, *message.sdpMlineIndex});
+          } else {
+            pc->AddRemoteCandidate(*message.candidate, *message.sdpMid,
+                                   *message.sdpMlineIndex);
+          }
+        } else {
+          std::cerr << "WebrtcManagerImpl: Received CANDIDATE with missing "
+                       "fields or PC not created for "
+                    << peer_id << std::endl;
+          peer_error_handler = onPeerErrorHandler_;
+          peer_error_message = "Received CANDIDATE with missing fields or PC";
+        }
+        break;
       }
-      break;
+      case SignalMessage::Type::UNKNOWN:
+      default:
+        std::cerr
+            << "WebrtcManagerImpl: Received unknown signal message type from "
+            << peer_id << std::endl;
+        signaling_error_handler = onSignalingErrorHandler_;
+        signaling_error_message =
+            "Received unknown signal message type from " + peer_id;
+        break;
     }
-    case SignalMessage::Type::CANDIDATE: {
-      PeerConnection* pc = getOrCreatePeerConnection(
-          peer_id);  // ACQUIRES mutex_ internally or relies on current lock
-      if (pc && message.candidate && message.sdpMid && message.sdpMlineIndex) {
-        pc->AddRemoteCandidate(*message.candidate, *message.sdpMid,
-                               *message.sdpMlineIndex);
-      } else {
-        std::cerr << "WebrtcManagerImpl: Received CANDIDATE with missing "
-                     "fields or PC not created for "
-                  << peer_id << std::endl;
-        invokePeerErrorCallback(
-            peer_id,
-            "Received CANDIDATE with missing fields or PC");  // Calls invoke
-                                                              // helper
-      }
-      break;
-    }
-    case SignalMessage::Type::HEARTBEAT: {
-      // std::cout << "WebrtcManagerImpl: Received HEARTBEAT from " << peer_id
-      // << std::endl;
-      handleReceivedHeartbeat(
-          peer_id);  // ACQUIRES mutex_ or relies on current lock
-      break;
-    }
-    case SignalMessage::Type::UNKNOWN:
-    default:
-      std::cerr
-          << "WebrtcManagerImpl: Received unknown signal message type from "
-          << peer_id << std::endl;
-      invokeSignalingErrorCallback(
-          "Received unknown signal message type from " +
-          peer_id);  // Calls invoke helper
-      break;
+  }
+
+  if (peer_error_handler && !peer_error_message.empty()) {
+    peer_error_handler(message.from, peer_error_message);
+  }
+  if (signaling_error_handler && !signaling_error_message.empty()) {
+    signaling_error_handler(signaling_error_message);
   }
 }
 
@@ -623,8 +626,9 @@ PeerConnection* WebrtcManagerImpl::getOrCreatePeerConnection(
       [this, peer_id](IceConnectionState state) {
         handlePeerIceConnectionStateChange(peer_id, state);  // ACQUIRES mutex_
       };
-  pc_callbacks.onSignalingStateChange = [this, peer_id](int state) {
-    handlePeerSignalingStateChange(peer_id, state);  // ACQUIRES mutex_
+  pc_callbacks.onSignalingStateChange = [this, peer_id](SignalingState state) {
+    handlePeerSignalingStateChange(peer_id,
+                                   static_cast<int>(state));  // ACQUIRES mutex_
   };
   pc_callbacks.onDataChannelOpened = [this, peer_id](const std::string& label) {
     handlePeerDataChannelOpened(peer_id, label);  // ACQUIRES mutex_
@@ -657,6 +661,8 @@ PeerConnection* WebrtcManagerImpl::getOrCreatePeerConnection(
   // Store and return the new PC
   // The map access is protected by the caller's lock
   peerConnections_[peer_id] = std::move(pc);
+  remoteDescriptionSet_[peer_id] = false;
+  pendingRemoteCandidates_.erase(peer_id);
   return peerConnections_[peer_id].get();
 }
 
@@ -683,13 +689,15 @@ void WebrtcManagerImpl::destroyPeerConnection(const std::string& peer_id,
     // Remove from heartbeat tracking
     lastHeartbeatRxTime_.erase(peer_id);
     reconnectionAttemptCount_.erase(peer_id);
+    remoteDescriptionSet_.erase(peer_id);
+    pendingRemoteCandidates_.erase(peer_id);
 
     // Remove the unique_ptr from the map (this destroys the PeerConnection
     // object)
     peerConnections_.erase(it);
 
-    // Invoke application callback (safely)
-    invokePeerDisconnectedCallback(peer_id, reason);  // Calls invoke helper
+    // Do not invoke application callbacks while manager mutex is held.
+    // Callers should notify disconnection after lock release.
   } else {
     // std::cout << "WebrtcManagerImpl: Attempted to destroy non-existent PC for
     // " << peer_id << std::endl;
@@ -731,11 +739,10 @@ std::
   // auto pc_impl = std::make_unique<LibwebrtcPeerConnection>(rtc_pc,
   // callbacks); // Pass libwebrtc PC and our callbacks struct
 
-  // Dummy creation for skeleton
-  auto pc_impl = std::make_unique<LibwebrtcPeerConnection>();  // Dummy instance
-  pc_impl->SetCallbacks(callbacks);  // Set the provided callbacks
-
-  return std::move(pc_impl);  // Return the unique_ptr
+  // Skeleton mode: no concrete PeerConnection implementation is wired here.
+  // Return nullptr so callers can fail gracefully until integration is added.
+  (void)callbacks;
+  return nullptr;
 }
 
 // --- Internal Handlers for PeerConnection Events ---
@@ -746,34 +753,38 @@ void WebrtcManagerImpl::handlePeerLocalSdpGenerated(
     const std::string& peer_id, const std::string& sdp_type,
     const std::string& sdp_string) {
   // Called by WebRTC signaling thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cout << "WebrtcManagerImpl: Local SDP generated for " << peer_id
-            << ", type=" << sdp_type << std::endl;
+  OnSignalingErrorHandler error_handler;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cout << "WebrtcManagerImpl: Local SDP generated for " << peer_id
+              << ", type=" << sdp_type << std::endl;
 
-  // Check if the peer connection still exists
-  if (!peerConnections_.count(peer_id)) {
-    std::cout << "WebrtcManagerImpl: Ignoring SDP for non-existent peer "
-              << peer_id << std::endl;
-    return;
+    // Check if the peer connection still exists
+    if (!peerConnections_.count(peer_id)) {
+      std::cout << "WebrtcManagerImpl: Ignoring SDP for non-existent peer "
+                << peer_id << std::endl;
+      return;
+    }
+
+    SignalMessage msg;
+    msg.type = (sdp_type == "offer") ? SignalMessage::Type::OFFER
+                                     : SignalMessage::Type::ANSWER;
+    msg.from = "client_dummy_id";
+    msg.to = peer_id;
+    msg.sdp = sdp_string;
+
+    if (signalingClient_) {
+      signalingClient_->sendSignal(msg);
+    } else {
+      std::cerr
+          << "WebrtcManagerImpl: Signaling client not available to send SDP."
+          << std::endl;
+      error_handler = onSignalingErrorHandler_;
+    }
   }
 
-  // Create signal message and send via SignalingClient
-  SignalMessage msg;
-  msg.type = (sdp_type == "offer") ? SignalMessage::Type::OFFER
-                                   : SignalMessage::Type::ANSWER;
-  // msg.from = config_.client_id; // Needs client ID from config
-  msg.from = "client_dummy_id";  // Dummy ID for skeleton
-  msg.to = peer_id;
-  msg.sdp = sdp_string;
-
-  if (signalingClient_) {
-    signalingClient_->sendSignal(msg);  // Send via signaling client (should be
-                                        // thread-safe or use event loop)
-  } else {
-    std::cerr
-        << "WebrtcManagerImpl: Signaling client not available to send SDP."
-        << std::endl;
-    invokeSignalingErrorCallback("Signaling client not available to send SDP");
+  if (error_handler) {
+    error_handler("Signaling client not available to send SDP");
   }
 }
 
@@ -781,89 +792,97 @@ void WebrtcManagerImpl::handlePeerLocalCandidateGenerated(
     const std::string& peer_id, const std::string& candidate,
     const std::string& sdp_mid, int sdp_mline_index) {
   // Called by WebRTC signaling thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cout << "WebrtcManagerImpl: Local Candidate generated for " << peer_id
-            << std::endl;
+  OnSignalingErrorHandler error_handler;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cout << "WebrtcManagerImpl: Local Candidate generated for " << peer_id
+              << std::endl;
 
-  // Check if the peer connection still exists
-  if (!peerConnections_.count(peer_id)) {
-    std::cout << "WebrtcManagerImpl: Ignoring candidate for non-existent peer "
-              << peer_id << std::endl;
-    return;
+    if (!peerConnections_.count(peer_id)) {
+      std::cout
+          << "WebrtcManagerImpl: Ignoring candidate for non-existent peer "
+          << peer_id << std::endl;
+      return;
+    }
+
+    SignalMessage msg;
+    msg.type = SignalMessage::Type::CANDIDATE;
+    msg.from = "client_dummy_id";
+    msg.to = peer_id;
+    msg.candidate = candidate;
+    msg.sdpMid = sdp_mid;
+    msg.sdpMlineIndex = sdp_mline_index;
+
+    if (signalingClient_) {
+      signalingClient_->sendSignal(msg);
+    } else {
+      std::cerr << "WebrtcManagerImpl: Signaling client not available to send "
+                   "candidate."
+                << std::endl;
+      error_handler = onSignalingErrorHandler_;
+    }
   }
 
-  // Create signal message and send via SignalingClient
-  SignalMessage msg;
-  msg.type = SignalMessage::Type::CANDIDATE;
-  // msg.from = config_.client_id; // Needs client ID from config
-  msg.from = "client_dummy_id";  // Dummy ID for skeleton
-  msg.to = peer_id;
-  msg.candidate = candidate;
-  msg.sdpMid = sdp_mid;
-  msg.sdpMlineIndex = sdp_mline_index;
-
-  if (signalingClient_) {
-    signalingClient_->sendSignal(msg);  // Send via signaling client (should be
-                                        // thread-safe or use event loop)
-  } else {
-    std::cerr << "WebrtcManagerImpl: Signaling client not available to send "
-                 "candidate."
-              << std::endl;
-    invokeSignalingErrorCallback(
-        "Signaling client not available to send candidate");
+  if (error_handler) {
+    error_handler("Signaling client not available to send candidate");
   }
 }
 
 void WebrtcManagerImpl::handlePeerConnectionStateChange(
     const std::string& peer_id, PeerConnectionState state) {
-  // Called by WebRTC signaling thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  // TODO: Map int state to meaningful enum/string from libwebrtc
-  std::cout << "WebrtcManagerImpl: PeerConnection state change for " << peer_id
-            << ", state=" << static_cast<int>(state) << std::endl;
+  OnPeerConnectedHandler peer_connected_handler;
+  OnPeerDisconnectedHandler peer_disconnected_handler;
+  std::string disconnect_reason;
+  bool should_notify_disconnected = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // TODO: Map int state to meaningful enum/string from libwebrtc
+    std::cout << "WebrtcManagerImpl: PeerConnection state change for "
+              << peer_id << ", state=" << static_cast<int>(state) << std::endl;
 
-  // Check if the peer connection still exists
-  if (!peerConnections_.count(peer_id)) {
-    std::cout << "WebrtcManagerImpl: State change for non-existent peer "
-              << peer_id << std::endl;
-    return;
+    if (!peerConnections_.count(peer_id)) {
+      std::cout << "WebrtcManagerImpl: State change for non-existent peer "
+                << peer_id << std::endl;
+      return;
+    }
+
+    if (state == PeerConnectionState::Connected) {
+      std::cout << "WebrtcManagerImpl: Peer " << peer_id << " connected!"
+                << std::endl;
+      peer_connected_handler = onPeerConnectedHandler_;
+
+      // TODO: Start heartbeat for this peer if enabled
+      // if (config_.heartbeat_interval_ms > 0) {
+      //     lastHeartbeatRxTime_[peer_id] = std::chrono::steady_clock::now();
+      //     // Ensure timer is running and checks include this peer
+      // }
+    } else if (state == PeerConnectionState::Disconnected ||
+               state == PeerConnectionState::Failed ||
+               state == PeerConnectionState::Closed) {
+      std::string reason =
+          "PC State: " + std::to_string(static_cast<int>(state));
+      if (state == PeerConnectionState::Disconnected)
+        reason = "PC State: Disconnected";
+      else if (state == PeerConnectionState::Failed)
+        reason = "PC State: Failed";
+      else if (state == PeerConnectionState::Closed)
+        reason = "PC State: Closed";
+
+      std::cout << "WebrtcManagerImpl: Peer " << peer_id
+                << " disconnected/failed/closed. Reason: " << reason
+                << std::endl;
+      destroyPeerConnection(peer_id, reason);
+      peer_disconnected_handler = onPeerDisconnectedHandler_;
+      disconnect_reason = reason;
+      should_notify_disconnected = true;
+    }
   }
 
-  if (state == PeerConnectionState::Connected) {  // Use enum
-    std::cout << "WebrtcManagerImpl: Peer " << peer_id << " connected!"
-              << std::endl;
-    // Invoke application callback (safely)
-    invokePeerConnectedCallback(peer_id);  // Calls invoke helper
-
-    // TODO: Start heartbeat for this peer if enabled
-    // if (config_.heartbeat_interval_ms > 0) {
-    //     lastHeartbeatRxTime_[peer_id] = std::chrono::steady_clock::now();
-    //     // Ensure timer is running and checks include this peer
-    // }
-  } else if (state == PeerConnectionState::Disconnected ||
-             state == PeerConnectionState::Failed ||
-             state == PeerConnectionState::Closed) {  // Use enums
-    std::string reason =
-        "PC State: " + std::to_string(static_cast<int>(
-                           state));  // Map state int to string for clarity
-    if (state == PeerConnectionState::Disconnected)
-      reason = "PC State: Disconnected";
-    else if (state == PeerConnectionState::Failed)
-      reason = "PC State: Failed";
-    else if (state == PeerConnectionState::Closed)
-      reason = "PC State: Closed";
-
-    std::cout << "WebrtcManagerImpl: Peer " << peer_id
-              << " disconnected/failed/closed. Reason: " << reason << std::endl;
-    // Clean up the peer connection instance and notify app.
-    // destroyPeerConnection(peer_id, reason); // This method ACQUIRES mutex_ or
-    // relies on current lock. Calling it here might cause re-entrancy issues if
-    // erase() triggers destructor and more callbacks. Safer: Queue cleanup or
-    // perform cleanup after the state change handler returns. For simplicity in
-    // skeleton, call destroy here and be aware of potential issues.
-    destroyPeerConnection(peer_id,
-                          reason);  // Calls destroy helper which acquires mutex
-                                    // and removes from map.
+  if (peer_connected_handler) {
+    peer_connected_handler(peer_id);
+  }
+  if (should_notify_disconnected && peer_disconnected_handler) {
+    peer_disconnected_handler(peer_id, disconnect_reason);
   }
 }
 
@@ -959,57 +978,59 @@ void WebrtcManagerImpl::handlePeerDataChannelMessage(
     const std::string& peer_id, const std::string& label,
     const DataChannelMessage& message) {
   // Called by WebRTC signaling thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  // std::cout << "WebrtcManagerImpl: DataChannel message received for " <<
-  // peer_id << ", label=" << label << ", size=" << message.size() << std::endl;
+  OnDataChannelMessageReceivedHandler handler;
+  bool should_invoke = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // std::cout << "WebrtcManagerImpl: DataChannel message received for " <<
+    // peer_id << ", label=" << label << ", size=" << message.size() <<
+    // std::endl;
 
-  // Check if the peer connection still exists
-  if (!peerConnections_.count(peer_id)) {
-    std::cout << "WebrtcManagerImpl: DataChannel message for non-existent peer "
-              << peer_id << std::endl;
-    return;
+    if (!peerConnections_.count(peer_id)) {
+      std::cout
+          << "WebrtcManagerImpl: DataChannel message for non-existent peer "
+          << peer_id << std::endl;
+      return;
+    }
+
+    if (label == "control") {
+      handler = onDataChannelMessageReceivedHandler_;
+      should_invoke = true;
+    } else if (label == "telemetry") {
+      handler = onDataChannelMessageReceivedHandler_;
+      should_invoke = true;
+    } else {
+      std::cout << "WebrtcManagerImpl: Received message on unknown DataChannel "
+                   "label: "
+                << label << " from " << peer_id << std::endl;
+    }
   }
 
-  // Check label and route message
-  // TODO: Use config values for labels
-  // if (label == config_.control_channel_label) {
-  if (label == "control") {  // Dummy check for skeleton
-    invokeDataChannelMessageReceivedCallback(peer_id, label,
-                                             message);  // Calls invoke helper
-  }
-  // else if (label == config_.telemetry_channel_label) { // Needs config
-  else if (label == "telemetry") {  // Dummy check for skeleton
-    // This might be loopback telemetry if the remote echoes it
-    // Assuming telemetry received here should also be routed to the app
-    invokeDataChannelMessageReceivedCallback(peer_id, label,
-                                             message);  // Calls invoke helper
-  }
-  // TODO: Handle Heartbeat messages here based on label/content
-  // else if (label == "heartbeat" && message == "ping") {
-  // handleReceivedHeartbeat(peer_id); }
-  else {
-    std::cout
-        << "WebrtcManagerImpl: Received message on unknown DataChannel label: "
-        << label << " from " << peer_id << std::endl;
-    // Log unexpected message
+  if (should_invoke && handler) {
+    handler(peer_id, label, message);
   }
 }
 
 void WebrtcManagerImpl::handlePeerError(const std::string& peer_id,
                                         const std::string& error_msg) {
-  // Called by WebRTC signaling thread. ACQUIRE mutex_.
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::cerr << "WebrtcManagerImpl: PeerConnection error for " << peer_id << ": "
-            << error_msg << std::endl;
+  OnPeerErrorHandler handler;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::cerr << "WebrtcManagerImpl: PeerConnection error for " << peer_id
+              << ": " << error_msg << std::endl;
 
-  // Check if the peer connection still exists
-  if (!peerConnections_.count(peer_id)) {
-    std::cout << "WebrtcManagerImpl: Error for non-existent peer " << peer_id
-              << std::endl;
-    return;
+    if (!peerConnections_.count(peer_id)) {
+      std::cout << "WebrtcManagerImpl: Error for non-existent peer " << peer_id
+                << std::endl;
+      return;
+    }
+
+    handler = onPeerErrorHandler_;
   }
 
-  invokePeerErrorCallback(peer_id, error_msg);  // Calls invoke helper
+  if (handler) {
+    handler(peer_id, error_msg);
+  }
   // Error might mean the connection is going down, StateChange handler should
   // catch closure and perform cleanup.
 }
@@ -1055,13 +1076,6 @@ void WebrtcManagerImpl::onHeartbeatTimer() {
   checkForHeartbeatLoss();  // Check for lost heartbeats
 
   // Send heartbeats to connected peers
-  SignalMessage heartbeat_msg;
-  heartbeat_msg.type = SignalMessage::Type::HEARTBEAT;
-  // heartbeat_msg.from = config_.client_id; // Needs client ID from config
-  heartbeat_msg.from = "client_dummy_id";  // Dummy ID for skeleton
-  // Heartbeat content might include timestamp or sequence number for tracking.
-  heartbeat_msg.message = "ping";  // Dummy content
-
   for (auto const& [peer_id, pc] : peerConnections_) {
     if (pc &&
         pc->GetConnectionState() ==
