@@ -17,6 +17,6 @@
 		"install:browsers:cn": "PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright npx playwright install chromium"
 	},
 	"devDependencies": {
-		"playwright": "1.43.1"
+		"playwright": "1.55.1"
 	}
 }
